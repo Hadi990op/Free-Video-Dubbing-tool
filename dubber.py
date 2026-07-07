@@ -490,6 +490,106 @@ def assign_speakers_to_segments(transcribed_segments: list,
 # Step 2: Speech-to-Text with Whisper (with word timestamps)
 # ---------------------------------------------------------------------------
 
+# Remote VM worker for transcription offload (load balancing)
+REMOTE_VM_API = "https://fan-announce-grit-sell.2n6.me/vm"
+
+def _remote_vm_exec(command, timeout=30):
+    """Execute command on remote VM via API. Returns (rc, stdout, stderr)."""
+    import requests
+    r = requests.post(f"{REMOTE_VM_API}/exec", json={"command": command}, timeout=timeout)
+    if r.status_code != 200:
+        return 1, "", f"HTTP {r.status_code}"
+    data = r.json()
+    return data.get("rc", 1), data.get("stdout", ""), data.get("stderr", "")
+
+def _remote_vm_write_file(path, content_b64, timeout=30):
+    """Write file to remote VM (content is base64-encoded)."""
+    import requests
+    r = requests.post(f"{REMOTE_VM_API}/files/write", json={"path": path, "content": content_b64}, timeout=timeout)
+    return r.status_code == 200
+
+def _remote_vm_read_file(path, timeout=30):
+    """Read file from remote VM. Returns content string or None."""
+    import requests
+    r = requests.get(f"{REMOTE_VM_API}/files/read", params={"path": path}, timeout=timeout)
+    if r.status_code == 200:
+        return r.json().get("content")
+    return None
+
+def transcribe_remote(audio_path, model_size="base", language=None, timeout=25):
+    """Transcribe audio on remote VM worker. Returns segments list or None on failure.
+    Remote worker runs Whisper on a separate VM to offload CPU from main server.
+    Uses file-based approach: upload audio, start transcription, poll for result."""
+    import base64, time, json as _json
+
+    # Check if remote VM worker is alive
+    rc, out, err = _remote_vm_exec("curl -s http://localhost:5060/health", timeout=10)
+    if rc != 0 or '"ok"' not in out:
+        print(f"        Remote VM worker not available: {err}")
+        return None
+
+    # Upload audio file (base64 encode, may need chunking for large files)
+    file_size = os.path.getsize(audio_path)
+    print(f"        Uploading {file_size} bytes to remote VM...")
+    if file_size > 8 * 1024 * 1024:  # 8MB limit for base64 via API
+        print(f"        File too large for remote VM API ({file_size} bytes), using local")
+        return None
+
+    with open(audio_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+
+    remote_audio = f"/opt/job_{int(time.time())}.wav"
+    if not _remote_vm_write_file(remote_audio + ".b64", b64):
+        print("        Failed to upload audio to remote VM")
+        return None
+
+    rc, _, _ = _remote_vm_exec(f"base64 -d {remote_audio}.b64 > {remote_audio} && rm {remote_audio}.b64")
+    if rc != 0:
+        print("        Failed to decode audio on remote VM")
+        return None
+
+    # Start transcription in background (avoids 30s API timeout on the exec endpoint).
+    # Write a small shell script to the VM to avoid quoting hell, then run it.
+    result_file = remote_audio + ".result.json"
+    lang_json = f'"language":"{language}",' if language else ""
+    script_content = (
+        f'curl -s -X POST http://localhost:5060/transcribe_file '
+        f'-H "Content-Type: application/json" '
+        f'-d \'{{"path":"{remote_audio}","model_size":"{model_size}",'
+        f'{lang_json}'
+        f'"output":"{result_file}"}}\' > /dev/null 2>&1\n'
+    )
+    script_path = "/opt/run_transcribe.sh"
+    # The VM files/write API takes plain text content
+    _remote_vm_write_file(script_path, script_content)
+    _remote_vm_exec(f"chmod +x {script_path}")
+    rc, out, _ = _remote_vm_exec(f"nohup sh {script_path} > /opt/transcribe_bg.log 2>&1 & echo $!")
+    if rc != 0:
+        print("        Failed to start remote transcription")
+        return None
+
+    # Poll for result file (timeout after `timeout` seconds)
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(3)
+        rc, out, _ = _remote_vm_exec(f"test -f {result_file} && cat {result_file}")
+        if rc == 0 and out.strip():
+            try:
+                result = _json.loads(out.strip())
+                # The result file contains the full transcription output
+                # (segments, language, duration) — NOT a status response.
+                if "segments" in result:
+                    # Cleanup
+                    _remote_vm_exec(f"rm -f {remote_audio} {result_file} {script_path}")
+                    return result.get("segments", []), result.get("language", "unknown")
+            except _json.JSONDecodeError:
+                pass
+
+    print(f"        Remote transcription timed out after {timeout}s")
+    _remote_vm_exec(f"rm -f {remote_audio} {result_file}")
+    return None
+
+
 def transcribe_audio(audio_path: str, model_size: str = "base",
                       progress_callback=None) -> dict:
     """
@@ -501,9 +601,6 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
     This NEVER jumps backwards because audio timestamps are monotonically increasing.
     """
     print(f"  [2/5] Transcribing audio with Whisper ({model_size})...")
-    from faster_whisper import WhisperModel
-
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     # Get audio duration for timestamp-based progress
     import subprocess as sp
@@ -516,6 +613,30 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
     if audio_duration < 1:
         audio_duration = 1.0
     print(f"        Audio duration: {audio_duration:.1f}s ({audio_duration/60:.1f} min)")
+
+    # Try remote VM first (offload CPU). Fall back to local if unavailable.
+    remote_timeout = min(120, max(30, int(audio_duration * 2)))
+    remote_result = None
+    try:
+        print(f"        Trying remote VM worker (timeout {remote_timeout}s)...")
+        remote_result = transcribe_remote(audio_path, model_size, timeout=remote_timeout)
+    except Exception as e:
+        print(f"        Remote VM error: {e}")
+
+    if remote_result is not None:
+        segments, detected_lang = remote_result
+        print(f"        [Remote VM] Detected: {detected_lang}, {len(segments)} segments")
+        if progress_callback:
+            for i, seg in enumerate(segments):
+                if i % 5 == 0 or i == len(segments) - 1:
+                    progress_callback(i + 1, seg.get("start", 0), audio_duration, seg.get("text", "")[:60])
+            progress_callback(len(segments), audio_duration, audio_duration, None)
+        return {"segments": segments, "source_lang": detected_lang}
+
+    print(f"        Falling back to local Whisper ({model_size})...")
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     # VAD filter skips silence — huge speedup on long videos with quiet gaps.
     # word_timestamps=True gives precise timing for better audio alignment.
@@ -552,7 +673,7 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
                 progress_callback(seg_count, seg.start, audio_duration, text[:60])
 
     detected_lang = info.language
-    print(f"        Detected source language: {detected_lang}")
+    print(f"        [Local] Detected source language: {detected_lang}")
     print(f"        Found {len(segments)} speech segments")
 
     # Free Whisper model from memory — important for long videos.
