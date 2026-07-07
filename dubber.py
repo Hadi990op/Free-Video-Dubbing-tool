@@ -1978,19 +1978,27 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
                             f.write(f"file '{seg_path}'\n")
                 
-                # Concat all segments
+                # Concat all segments — MUST re-encode (not -c copy) because
+                # each segment has its own GOP/DTS structure and stream copy
+                # produces non-monotonic DTS → player freezes after 1-2s.
                 extended_video = os.path.join(temp_vdir, "extended.mp4")
                 concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                             "-i", concat_list, "-c", "copy", extended_video]
+                             "-i", concat_list,
+                             "-c:v", "libx264", "-crf", "20",
+                             "-pix_fmt", "yuv420p",
+                             "-r", "24",
+                             "-vsync", "cfr",
+                             "-an", extended_video]
                 result = subprocess.run(concat_cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0 and os.path.exists(extended_video):
-                    # Now mux with audio
+                    # Now mux with audio — re-encode video if burning subtitles
+                    # (can't use -c:v copy with -vf subtitles)
                     if burn_subtitles and srt_path and os.path.exists(srt_path):
                         escaped_srt = srt_path.replace("'", r"'\''")
                         cmd = ["ffmpeg", "-y", "-i", extended_video, "-i", audio_path,
                                "-map", "0:v", "-map", "1:a",
-                               "-c:v", "copy",
+                               "-c:v", "libx264", "-crf", "20",
                                "-vf", f"subtitles='{escaped_srt}'",
                                "-c:a", "aac", "-b:a", "192k",
                                output_path]
