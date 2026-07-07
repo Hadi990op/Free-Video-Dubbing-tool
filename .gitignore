@@ -48,3 +48,4 @@ token.txt
 # Checkpoints
 checkpoint.json
 translation_checkpoint.json
+.hf_token
