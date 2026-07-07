@@ -991,19 +991,23 @@ def _clone_local(text: str, ref_audio_path: str, out_path: str,
     return False
 
 
-# --- HuggingFace Gradio-space fallback (kept as secondary) ---
+# --- HuggingFace Gradio-space voice cloning (primary GPU-backed backends) ---
+# Pipeline order:
+#   1. Chatterbox Multilingual V3  — 23 languages, exaggeration=emotion control,
+#      real zero-shot voice cloning. MIT-licensed, free GPU via ZeroGPU.
+#   2. IndexTTS-2  — 8 emotion vectors (Happy/Angry/Sad/Afraid/etc),
+#      fine-grained emotion control. Apache-2.0, free GPU via ZeroGPU.
+#   3. Old XTTS spaces (hasanbasbunar/tonyassi) — legacy fallback.
 _hf_clients = None
 _hf_client_lock = threading.Lock()
 
-# Spaces to try in order. Each is a (space_id, api_name) tuple.
-# Primary: hasanbasbunar/Voice-Cloning-XTTS-v2 (free GPU, supports Hindi + 16 langs)
-# Fallback: tonyassi/voice-clone (English-only, may have quota issues)
-_HF_VOICE_SPACES = [
-    ("hasanbasbunar/Voice-Cloning-XTTS-v2", "/voice_clone_synthesis"),
-    ("tonyassi/voice-clone", "/clone"),
-]
+# Chatterbox Multilingual V3 language codes (23 languages)
+_CHATTERBOX_LANGS = {
+    'en', 'ar', 'da', 'de', 'el', 'es', 'fi', 'fr', 'he', 'hi', 'it',
+    'ja', 'ko', 'ms', 'nl', 'no', 'pl', 'pt', 'ru', 'sv', 'sw', 'tr', 'zh',
+}
 
-# XTTS language names supported by the hasanbasbunar space
+# Old XTTS language names (for legacy hasanbasbunar space)
 _XTTS_LANG_NAMES = {
     'en': 'English', 'fr': 'French', 'es': 'Spanish', 'de': 'German',
     'it': 'Italian', 'pt': 'Portuguese', 'pl': 'Polish', 'tr': 'Turkish',
@@ -1011,6 +1015,18 @@ _XTTS_LANG_NAMES = {
     'zh': 'Chinese', 'zh-cn': 'Chinese', 'ja': 'Japanese', 'ko': 'Korean',
     'hu': 'Hungarian', 'hi': 'Hindi',
 }
+
+# Legacy spaces (fallback)
+_HF_VOICE_SPACES = [
+    ("hasanbasbunar/Voice-Cloning-XTTS-v2", "/voice_clone_synthesis"),
+    ("tonyassi/voice-clone", "/clone"),
+]
+
+# Lazy singleton clients for Chatterbox and IndexTTS-2
+_chatterbox_client = None
+_chatterbox_lock = threading.Lock()
+_indextts_client = None
+_indextts_lock = threading.Lock()
 
 
 def _get_hf_clients():
@@ -1027,19 +1043,171 @@ def _get_hf_clients():
         if not hf_token and os.path.exists(token_path):
             with open(token_path) as f:
                 hf_token = f.read().strip()
-        if hf_token:
             os.environ["HF_TOKEN"] = hf_token
         clients = []
         for space_id, api_name in _HF_VOICE_SPACES:
             try:
-                if hf_token:
-                    clients.append((Client(space_id, verbose=False, hf_token=hf_token), api_name))
-                else:
-                    clients.append((Client(space_id, verbose=False), api_name))
+                clients.append((Client(space_id, verbose=False), api_name))
             except Exception as e:
                 print(f"        ⚠ Could not connect to HF space {space_id}: {e!r}")
         _hf_clients = clients
         return _hf_clients
+
+
+def _get_chatterbox_client():
+    """Lazily connect to the Chatterbox Multilingual V3 HF Space."""
+    global _chatterbox_client
+    if _chatterbox_client is not None:
+        return _chatterbox_client
+    with _chatterbox_lock:
+        if _chatterbox_client is not None:
+            return _chatterbox_client
+        from gradio_client import Client
+        hf_token = os.environ.get("HF_TOKEN", "")
+        token_path = os.path.join(os.path.dirname(__file__), ".hf_token")
+        if not hf_token and os.path.exists(token_path):
+            with open(token_path) as f:
+                hf_token = f.read().strip()
+            os.environ["HF_TOKEN"] = hf_token
+        try:
+            kwargs = {"verbose": False}
+            _chatterbox_client = Client("ResembleAI/Chatterbox-Multilingual-TTS-V3", **kwargs)
+            print("        ✓ Connected to Chatterbox Multilingual V3")
+        except Exception as e:
+            print(f"        ⚠ Could not connect to Chatterbox V3: {e!r}")
+            _chatterbox_client = False  # mark as failed
+        return _chatterbox_client
+
+
+def _clone_chatterbox(text: str, ref_audio_path: str, out_path: str,
+                      target_lang: str = "en", max_retries: int = 2) -> bool:
+    """Generate cloned speech via Chatterbox Multilingual V3 HF Space.
+    Supports 23 languages with exaggeration control (emotion).
+    Zero-shot voice cloning from 5+ seconds of reference audio."""
+    if target_lang not in _CHATTERBOX_LANGS:
+        return False  # language not supported
+    client = _get_chatterbox_client()
+    if not client:
+        return False
+    from gradio_client import handle_file
+    safe_text = text.strip()
+    if not safe_text:
+        return False
+    if len(safe_text) > 300:
+        safe_text = safe_text[:300]  # Chatterbox max 300 chars
+
+    for attempt in range(max_retries):
+        try:
+            result = client.predict(
+                text_input=safe_text,
+                audio_prompt_path_input=handle_file(ref_audio_path),
+                language_id_input=target_lang,
+                exaggeration_input=0.5,  # neutral; can be raised for more emotion
+                temperature_input=0.8,
+                seed_num_input=0,
+                cfgw_input=0.5,
+                api_name="/generate_tts_audio",
+            )
+            # Result may be a dict with 'value' key, a filepath string, or tuple
+            if isinstance(result, dict):
+                result = result.get('value', result)
+            elif isinstance(result, (tuple, list)):
+                result = result[0] if result else None
+            if result and os.path.exists(result) and os.path.getsize(result) > 0:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", result,
+                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-c:a", "libmp3lame", out_path
+                ], capture_output=True, text=True)
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "quota" in msg or "zerogpu" in msg:
+                print(f"        ⚠ Chatterbox ZeroGPU quota exhausted")
+                return False  # don't retry, try next backend
+            if "not in the list" in msg or "language" in msg:
+                print(f"        ⚠ Chatterbox doesn't support language '{target_lang}'")
+                return False
+            if attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 3)
+    return False
+
+
+def _get_indextts_client():
+    """Lazily connect to the IndexTTS-2 HF Space."""
+    global _indextts_client
+    if _indextts_client is not None:
+        return _indextts_client
+    with _indextts_lock:
+        if _indextts_client is not None:
+            return _indextts_client
+        from gradio_client import Client
+        hf_token = os.environ.get("HF_TOKEN", "")
+        token_path = os.path.join(os.path.dirname(__file__), ".hf_token")
+        if not hf_token and os.path.exists(token_path):
+            with open(token_path) as f:
+                hf_token = f.read().strip()
+            os.environ["HF_TOKEN"] = hf_token
+        try:
+            kwargs = {"verbose": False}
+            _indextts_client = Client("IndexTeam/IndexTTS-2-Demo", **kwargs)
+            print("        ✓ Connected to IndexTTS-2")
+        except Exception as e:
+            print(f"        ⚠ Could not connect to IndexTTS-2: {e!r}")
+            _indextts_client = False
+        return _indextts_client
+
+
+def _clone_indextts(text: str, ref_audio_path: str, out_path: str,
+                   target_lang: str = "en", max_retries: int = 2) -> bool:
+    """Generate cloned speech via IndexTTS-2 HF Space.
+    Supports emotion control via 8 emotion vectors.
+    Uses 'Same as the voice reference' mode (emotion inherited from ref audio)."""
+    client = _get_indextts_client()
+    if not client:
+        return False
+    from gradio_client import handle_file
+    safe_text = text.strip()
+    if not safe_text:
+        return False
+    if len(safe_text) > 500:
+        safe_text = safe_text[:500]
+
+    for attempt in range(max_retries):
+        try:
+            result = client.predict(
+                emo_control_method="Same as the voice reference",
+                prompt=handle_file(ref_audio_path),
+                text=safe_text,
+                emo_ref_path=handle_file(ref_audio_path),
+                emo_weight=0.8,
+                vec1=0.0, vec2=0.0, vec3=0.0, vec4=0.0,
+                vec5=0.0, vec6=0.0, vec7=0.0, vec8=0.0,
+                emo_text="", emo_random=False,
+                max_text_tokens_per_segment=120,
+                api_name="/gen_single",
+            )
+            if isinstance(result, dict):
+                result = result.get('value', result)
+            elif isinstance(result, (tuple, list)):
+                result = result[0] if result else None
+            if result and os.path.exists(result) and os.path.getsize(result) > 0:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", result,
+                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-c:a", "libmp3lame", out_path
+                ], capture_output=True, text=True)
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "quota" in msg or "zerogpu" in msg:
+                print(f"        ⚠ IndexTTS-2 ZeroGPU quota exhausted")
+                return False
+            if attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 3)
+    return False
 
 
 def _clone_hf(text: str, ref_audio_path: str, out_path: str,
@@ -1103,24 +1271,36 @@ def clone_voice_tts(text: str, ref_audio_path: str, out_path: str,
     """Generate cloned speech for `text` using `ref_audio_path` as the voice
     reference. Writes audio to out_path (24kHz mono).
 
-    Order: HuggingFace XTTS-v2 (best quality, free GPU) → OpenVoice V2
+    Order: Chatterbox Multilingual V3 (23 langs, emotion) → IndexTTS-2
+    (emotion vectors) → HuggingFace XTTS-v2 (legacy) → OpenVoice V2
     (fast, all languages) → local Coqui XTTS-v2 → give up.
     Returns True on success."""
     if not ref_audio_path or not os.path.exists(ref_audio_path):
         return False
 
-    # 1) HuggingFace XTTS-v2 — BEST quality, real voice cloning (not just tone)
-    #    Free GPU, supports Hindi + 16 languages
+    # 1) Chatterbox Multilingual V3 — BEST quality, 23 languages, emotion control
+    #    Free GPU via HuggingFace ZeroGPU, real zero-shot voice cloning
+    if _clone_chatterbox(text, ref_audio_path, out_path,
+                         target_lang=target_lang, max_retries=2):
+        return True
+
+    # 2) IndexTTS-2 — fine-grained emotion vectors (8 emotions)
+    #    Inherits emotion from reference audio automatically
+    if _clone_indextts(text, ref_audio_path, out_path,
+                      target_lang=target_lang, max_retries=2):
+        return True
+
+    # 3) HuggingFace XTTS-v2 (legacy spaces) — fallback if Chatterbox/IndexTTS fail
     if _clone_hf(text, ref_audio_path, out_path, max_retries=2,
                 target_lang=target_lang):
         return True
 
-    # 2) OpenVoice V2 — fast tone conversion, works for ALL languages
+    # 4) OpenVoice V2 — fast tone conversion, works for ALL languages
     if edge_voice and _clone_openvoice(text, ref_audio_path, out_path,
                                         target_lang, edge_voice):
         return True
 
-    # 3) Local XTTS (fallback — slower, limited languages)
+    # 5) Local XTTS (fallback — slower, limited languages)
     if _clone_local(text, ref_audio_path, out_path, xtts_lang or "en"):
         return True
 
