@@ -351,6 +351,92 @@ def extract_audio(video_path: str, output_wav: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 1.5: Vocal Isolation (separate speech from background music/SFX)
+# ---------------------------------------------------------------------------
+
+def separate_vocals(audio_path: str, temp_dir: str,
+                    progress_callback=None) -> tuple:
+    """
+    Separate audio into vocals (speech) and no_vocals (background music + SFX).
+    Uses Demucs (Hybrid Transformer v4) — runs on CPU.
+
+    Returns: (vocals_wav_path, no_vocals_wav_path) or (None, None) on failure.
+    The vocals file is used for transcription (cleaner speech = better accuracy).
+    The no_vocals file is mixed with dubbed TTS to preserve original background.
+    """
+    print(f"  [1.5] Separating vocals from background (Demucs htdemucs)...")
+    if progress_callback:
+        progress_callback(1, "Separating vocals from background music...")
+
+    output_dir = os.path.join(temp_dir, "demucs_out")
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        from demucs.separate import main as demucs_main
+    except ImportError:
+        print("        demucs not installed, skipping vocal isolation")
+        return None, None
+
+    import sys
+    old_argv = sys.argv
+    sys.argv = [
+        "demucs",
+        "--two-stems", "vocals",   # vocals vs no_vocals
+        "-n", "htdemucs",          # Hybrid Demucs v4 (best quality)
+        "-o", output_dir,          # output directory
+        audio_path,
+    ]
+
+    try:
+        demucs_main()
+    except Exception as e:
+        print(f"        Demucs failed: {e}")
+        sys.argv = old_argv
+        return None, None
+    finally:
+        sys.argv = old_argv
+
+    # Find output files
+    track_name = os.path.splitext(os.path.basename(audio_path))[0]
+    vocals_path = os.path.join(output_dir, "htdemucs", track_name, "vocals.wav")
+    no_vocals_path = os.path.join(output_dir, "htdemucs", track_name, "no_vocals.wav")
+
+    # Fallback: check standard demucs output structure
+    if not os.path.exists(vocals_path):
+        htdemucs_dir = os.path.join(output_dir, "htdemucs")
+        if os.path.isdir(htdemucs_dir):
+            for d in os.listdir(htdemucs_dir):
+                v = os.path.join(htdemucs_dir, d, "vocals.wav")
+                nv = os.path.join(htdemucs_dir, d, "no_vocals.wav")
+                if os.path.exists(v) and os.path.exists(nv):
+                    vocals_path = v
+                    no_vocals_path = nv
+                    break
+
+    if os.path.exists(vocals_path) and os.path.exists(no_vocals_path):
+        # Convert to mono 16kHz for Whisper (vocals) and stereo 44.1kHz for mix (no_vocals)
+        vocals_16k = os.path.join(temp_dir, "vocals_16k.wav")
+        no_vocals_44k = os.path.join(temp_dir, "no_vocals_44k.wav")
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", vocals_path, "-vn", "-ac", "1", "-ar", "16000", vocals_16k],
+            capture_output=True, text=True
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", no_vocals_path, "-vn", "-ac", "2", "-ar", "44100", no_vocals_44k],
+            capture_output=True, text=True
+        )
+
+        if os.path.exists(vocals_16k) and os.path.exists(no_vocals_44k):
+            print(f"        Vocals isolated: {os.path.getsize(vocals_16k)} bytes")
+            print(f"        Background isolated: {os.path.getsize(no_vocals_44k)} bytes")
+            return vocals_16k, no_vocals_44k
+
+    print("        Vocal isolation failed (output files not found)")
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Step 1.5: Speaker Diarization (detect who speaks when)
 # ---------------------------------------------------------------------------
 
@@ -1729,7 +1815,8 @@ def atempo_filter(duration: float, target_duration: float) -> str:
 def build_dubbed_audio(tts_segments: list, total_duration: float,
                         temp_dir: str, keep_bg: bool = False,
                         original_audio_path: str = None,
-                        extend_video: bool = False) -> tuple:
+                        extend_video: bool = False,
+                        bg_volume: float = 0.35) -> tuple:
     """
     Build the final dubbed audio track by placing TTS segments at correct
     timestamps.
@@ -2011,8 +2098,8 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 "-i", mixed_path,
                 "-i", bg_path,
                 "-filter_complex",
-                "[0:a]volume=1.0[voice];"
-                "[1:a]volume=0.15,apad=whole_dur=90000[bg];"
+                f"[0:a]volume=1.0[voice];"
+                f"[1:a]volume={bg_volume:.2f},apad=whole_dur=90000[bg];"
                 "[voice][bg]amix=inputs=2:duration=first:normalize=0[a]",
                 "-map", "[a]", "-ac", "2", "-ar", "44100",
                 final_path
@@ -2360,6 +2447,7 @@ def dub_video(
     speaker_voices: dict = None,
     use_voice_cloning: bool = False,
     extend_video: bool = True,
+    keep_background_music: bool = False,
 ) -> dict:
     """
     Main function to dub a video.
@@ -2371,6 +2459,11 @@ def dub_video(
     assigns each a distinct voice from the VOICE_POOL. num_speakers can force
     a specific count. speaker_voices can override auto-assignment
     (mapping speaker_id -> voice_name).
+
+    keep_background_music: if True, uses Demucs to separate vocals from
+    background music/SFX. Transcribes from isolated vocals (better accuracy).
+    Mixes dubbed TTS with the original background (no_vocals) track.
+    This preserves background music and sound effects in the dubbed video.
 
     progress_callback(stage, message, sub_progress, sub_total):
       - stage: 1-7 or "done"
@@ -2460,6 +2553,26 @@ def dub_video(
             )
             total_duration = float(dur_result.stdout.strip() or "0")
 
+        # --- Stage 1.5: Vocal isolation (optional) ---
+        # Separate vocals (speech) from background (music/SFX) using Demucs.
+        # Transcribe from isolated vocals for better accuracy.
+        # Mix no_vocals track with dubbed TTS to preserve background music.
+        no_vocals_path = None
+        transcribe_audio_path = audio_wav  # default: transcribe from full audio
+        if keep_background_music:
+            if ckpt is None or ckpt["stage"] < 1:
+                # Only run if we just extracted audio (not resuming past stage 1)
+                pass
+            log(1, f"  [1.5] Isolating vocals from background music (Demucs)...")
+            vocals_path, no_vocals_path = separate_vocals(
+                audio_wav, temp_dir, progress_callback=progress_callback)
+            if vocals_path:
+                transcribe_audio_path = vocals_path
+                log(1, f"        ✅ Will transcribe from isolated vocals (cleaner speech)")
+            else:
+                log(1, f"        ⚠ Vocal isolation failed, using full audio")
+                no_vocals_path = None
+
         # --- Stage 2: Transcribe ---
         if ckpt is None or ckpt["stage"] < 2:
             log(2, f"  [2/5] Transcribing audio with Whisper ({model_size})...", 0, 0)
@@ -2477,7 +2590,7 @@ def dub_video(
                 # so progress bar = current_ts/total_dur — always monotonic
                 log(2, msg, current_ts, total_dur)
 
-            transcription = transcribe_audio(audio_wav, model_size,
+            transcription = transcribe_audio(transcribe_audio_path, model_size,
                                              progress_callback=transcribe_progress)
             segments = transcription["segments"]
             source_lang = transcription["source_lang"]
@@ -2659,12 +2772,24 @@ def dub_video(
         # --- Stage 5: Build dubbed audio ---
         if ckpt is None or ckpt["stage"] < 5:
             log(5, f"  [5/5] Building dubbed audio track...", 0, 1)
-            bg_audio_path = audio_wav if keep_background else None
+            # When keep_background_music: use isolated no_vocals track (music+SFX only)
+            # When keep_background (legacy): use full original audio (vocals+music at low vol)
+            # Otherwise: no background
+            if keep_background_music and no_vocals_path:
+                bg_audio_path = no_vocals_path
+                use_bg = True
+            elif keep_background:
+                bg_audio_path = audio_wav
+                use_bg = True
+            else:
+                bg_audio_path = None
+                use_bg = False
             final_audio, video_shift_points = build_dubbed_audio(
                 tts_segments, total_duration, temp_dir,
-                keep_bg=keep_background,
+                keep_bg=use_bg,
                 original_audio_path=bg_audio_path,
                 extend_video=extend_video,
+                bg_volume=0.35 if keep_background_music else 0.15,
             )
             log(5, f"Dubbed audio track built", 1, 1)
 

@@ -427,7 +427,7 @@ HTML_TEMPLATE = r"""
             <div class="toggle-row">
                 <label class="toggle">
                     <input type="checkbox" id="keepBg">
-                    🎵 Keep background audio (original voice at low volume)
+                    🎵 Keep background music (AI separates vocals from music/SFX)
                 </label>
                 <label class="toggle">
                     <input type="checkbox" id="burnSubtitles">
@@ -1112,6 +1112,7 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             model_size=model_size,
             output_path=output_path,
             keep_background=keep_bg,
+            keep_background_music=keep_bg,
             burn_subtitles=burn_subtitles,
             generate_srt_file=gen_srt,
             progress_callback=progress_callback,
