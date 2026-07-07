@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+env/
+ENV/
+
+# Runtime data
+uploads/
+outputs/
+jobs/
+pretrained_models/
+models/
+*.wav
+*.mp4
+*.mp3
+*.srt
+
+# Keep test fixtures if any
+!tests/fixtures/*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+nohup.out
+
+# Secrets / env
+.env
+*.key
+token.txt
+
+# Checkpoints
+checkpoint.json
+translation_checkpoint.json
