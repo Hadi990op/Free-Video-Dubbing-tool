@@ -570,14 +570,65 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
 # Step 3: Translate text segments
 # ---------------------------------------------------------------------------
 
+# Languages that should be romanized (written in Latin script like daily conversation)
+ROMAN_LANGS = {"hi", "ur"}
+
+def google_translate_romanized(text: str, target_lang: str, source_lang: str = "auto"):
+    """Translate text and return BOTH native script AND romanized version.
+    Uses Google's unofficial API which includes romanization (dt=rm).
+    For hi/ur, the romanized version is natural Roman Hindi/Urdu (Hinglish/Roman Urdu)
+    — like how people actually write in daily life (e.g. 'aap kya kar rahe ho?').
+    Returns: (native_text, roman_text)  — roman_text is None if not available."""
+    import requests
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = [
+        ("client", "gtx"), ("sl", source_lang), ("tl", target_lang),
+        ("dt", "t"), ("dt", "rm"), ("q", text)
+    ]
+    r = requests.get(url, params=params, timeout=15)
+    data = r.json()
+
+    # Native translation: data[0] contains [translated, original, ...] pairs
+    native_parts = []
+    for seg in data[0]:
+        if seg and seg[0]:
+            native_parts.append(seg[0])
+    native = " ".join(native_parts)
+
+    # Romanization: data[0][-1][2] contains romanized words (space-separated letters)
+    roman = None
+    try:
+        if data[0] and len(data[0]) > 0:
+            last = data[0][-1]
+            if last and len(last) > 2 and last[2]:
+                # last[2] is a list of romanized chunks, each with space-separated letters
+                roman_raw = " ".join(last[2])
+                # Clean: 'a a p  k y a' -> 'aap kya'
+                # Double-space = word boundary, single-space = letter separator within word
+                words = roman_raw.split("  ")
+                roman = " ".join("".join(w.split()) for w in words)
+                import re
+                roman = re.sub(r"\s+", " ", roman).strip()
+    except (IndexError, TypeError):
+        pass
+
+    return native, roman
+
+
 def translate_segments(segments: list, target_lang: str, source_lang: str = None,
                       job_dir: str = None, progress_callback=None) -> list:
     """Translate each segment's text to target language using Google Translate.
+    For hi/ur: produces Roman Hindi/Urdu (Hinglish/Roman Urdu) — natural daily-life
+    style like 'aap kya kar rahe ho?' instead of formal Devanagari/Arabic script.
+    This romanized text is what edge-tts speaks AND what subtitles show.
     Supports per-segment checkpointing: if job_dir is provided, saves progress
     to translation_checkpoint.json so it can resume if internet drops.
     progress_callback(done, total, preview) called per segment."""
-    print(f"  [3/5] Translating to '{LANG_NAMES.get(target_lang, target_lang)}'...")
-    from deep_translator import GoogleTranslator
+    use_roman = target_lang in ROMAN_LANGS
+    lang_label = LANG_NAMES.get(target_lang, target_lang)
+    if use_roman:
+        lang_label += " (Roman)"
+    print(f"  [3/5] Translating to '{lang_label}'...")
 
     # Load existing translation progress if resuming
     trans_ckpt_path = None
@@ -599,33 +650,54 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             except Exception:
                 pass
 
-    def make_translator():
-        return GoogleTranslator(source="auto", target=target_lang)
-
-    translator = make_translator()
+    # For non-roman languages, use deep_translator (simpler, more reliable)
+    if not use_roman:
+        from deep_translator import GoogleTranslator
+        def make_translator():
+            return GoogleTranslator(source="auto", target=target_lang)
+        translator = make_translator()
 
     for i, seg in enumerate(segments):
         # Skip if already translated from checkpoint
         if translated[i] is not None:
             continue
 
-        # Retry loop for network resilience
         max_retries = 5
         translated_text = None
-        for attempt in range(max_retries):
-            try:
-                translated_text = translator.translate(seg["text"])
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5  # 5s, 10s, 15s, 20s, 25s
-                    print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
-                    time.sleep(wait_time)
-                    # Recreate translator on retry — fresh session avoids stale state
-                    translator = make_translator()
-                else:
-                    print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
-                    translated_text = seg["text"]  # fallback to original
+
+        if use_roman:
+            # Romanized translation via Google's unofficial API
+            for attempt in range(max_retries):
+                try:
+                    native_text, roman_text = google_translate_romanized(
+                        seg["text"], target_lang, source_lang or "auto"
+                    )
+                    # Prefer roman text (natural daily style); fallback to native
+                    translated_text = roman_text if roman_text else native_text
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5
+                        print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
+                        translated_text = seg["text"]  # fallback to original
+        else:
+            # Non-roman: use deep_translator
+            for attempt in range(max_retries):
+                try:
+                    translated_text = translator.translate(seg["text"])
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5
+                        print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
+                        time.sleep(wait_time)
+                        translator = make_translator()
+                    else:
+                        print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
+                        translated_text = seg["text"]
 
         new_seg = dict(seg)
         new_seg["translated"] = translated_text
@@ -637,8 +709,7 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             with open(trans_ckpt_path, "w") as f:
                 json.dump({"translated": done}, f, ensure_ascii=False)
 
-        # Rate limit protection: small pause every 50 segments to avoid
-        # Google Translate temporarily blocking the IP on long videos.
+        # Rate limit protection
         if (i + 1) % 50 == 0 and i < len(segments) - 1:
             time.sleep(1)
 
