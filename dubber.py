@@ -996,9 +996,21 @@ _hf_clients = None
 _hf_client_lock = threading.Lock()
 
 # Spaces to try in order. Each is a (space_id, api_name) tuple.
+# Primary: hasanbasbunar/Voice-Cloning-XTTS-v2 (free GPU, supports Hindi + 16 langs)
+# Fallback: tonyassi/voice-clone (English-only, may have quota issues)
 _HF_VOICE_SPACES = [
+    ("hasanbasbunar/Voice-Cloning-XTTS-v2", "/voice_clone_synthesis"),
     ("tonyassi/voice-clone", "/clone"),
 ]
+
+# XTTS language names supported by the hasanbasbunar space
+_XTTS_LANG_NAMES = {
+    'en': 'English', 'fr': 'French', 'es': 'Spanish', 'de': 'German',
+    'it': 'Italian', 'pt': 'Portuguese', 'pl': 'Polish', 'tr': 'Turkish',
+    'ru': 'Russian', 'nl': 'Dutch', 'cs': 'Czech', 'ar': 'Arabic',
+    'zh': 'Chinese', 'zh-cn': 'Chinese', 'ja': 'Japanese', 'ko': 'Korean',
+    'hu': 'Hungarian', 'hi': 'Hindi',
+}
 
 
 def _get_hf_clients():
@@ -1031,22 +1043,39 @@ def _get_hf_clients():
 
 
 def _clone_hf(text: str, ref_audio_path: str, out_path: str,
-              max_retries: int = 2) -> bool:
-    """Generate speech via HuggingFace XTTS Gradio spaces (fallback)."""
+              max_retries: int = 2, target_lang: str = "en") -> bool:
+    """Generate speech via HuggingFace XTTS Gradio spaces.
+    Primary: hasanbasbunar/Voice-Cloning-XTTS-v2 (multi-language, free GPU)
+    Fallback: tonyassi/voice-clone (English-only)"""
     from gradio_client import handle_file
     clients = _get_hf_clients()
     if not clients:
         return False
     if len(text.strip()) > 500:
         text = text.strip()[:500]
+
+    # Convert lang code to XTTS language name
+    xtts_lang_name = _XTTS_LANG_NAMES.get(target_lang, "English")
+
     for attempt in range(max_retries):
         for client, api_name in clients:
             try:
-                result = client.predict(
-                    text=text,
-                    audio=handle_file(ref_audio_path),
-                    api_name=api_name,
-                )
+                if api_name == "/voice_clone_synthesis":
+                    # hasanbasbunar space: needs URL or file, language param
+                    result = client.predict(
+                        text=text,
+                        reference_audio_url=handle_file(ref_audio_path),
+                        example_audio_name=None,
+                        language=xtts_lang_name,
+                        api_name=api_name,
+                    )
+                else:
+                    # tonyassi space: simpler API
+                    result = client.predict(
+                        text=text,
+                        audio=handle_file(ref_audio_path),
+                        api_name=api_name,
+                    )
                 if result and os.path.exists(result) and os.path.getsize(result) > 0:
                     subprocess.run([
                         "ffmpeg", "-y", "-i", result,
@@ -1060,6 +1089,9 @@ def _clone_hf(text: str, ref_audio_path: str, out_path: str,
                 if "quota" in msg or "zerogpu" in msg:
                     print(f"        ⚠ HF ZeroGPU quota exhausted on this space")
                     continue  # try next space
+                if "not in the list" in msg:
+                    print(f"        ⚠ Language {xtts_lang_name} not supported by this space, trying next")
+                    continue
                 if attempt < max_retries - 1:
                     time.sleep((attempt + 1) * 3)
     return False
@@ -1071,23 +1103,25 @@ def clone_voice_tts(text: str, ref_audio_path: str, out_path: str,
     """Generate cloned speech for `text` using `ref_audio_path` as the voice
     reference. Writes audio to out_path (24kHz mono).
 
-    Order: OpenVoice V2 (fast, all languages) → local Coqui XTTS-v2
-    → HuggingFace XTTS spaces → give up (caller falls back to edge-tts).
+    Order: HuggingFace XTTS-v2 (best quality, free GPU) → OpenVoice V2
+    (fast, all languages) → local Coqui XTTS-v2 → give up.
     Returns True on success."""
     if not ref_audio_path or not os.path.exists(ref_audio_path):
         return False
 
-    # 1) OpenVoice V2 — fast tone conversion, works for ALL languages
+    # 1) HuggingFace XTTS-v2 — BEST quality, real voice cloning (not just tone)
+    #    Free GPU, supports Hindi + 16 languages
+    if _clone_hf(text, ref_audio_path, out_path, max_retries=2,
+                target_lang=target_lang):
+        return True
+
+    # 2) OpenVoice V2 — fast tone conversion, works for ALL languages
     if edge_voice and _clone_openvoice(text, ref_audio_path, out_path,
                                         target_lang, edge_voice):
         return True
 
-    # 2) Local XTTS (fallback — slower, limited languages)
+    # 3) Local XTTS (fallback — slower, limited languages)
     if _clone_local(text, ref_audio_path, out_path, xtts_lang or "en"):
-        return True
-
-    # 3) HF spaces fallback
-    if _clone_hf(text, ref_audio_path, out_path, max_retries=2):
         return True
 
     return False
@@ -1323,7 +1357,7 @@ def atempo_filter(duration: float, target_duration: float) -> str:
 def build_dubbed_audio(tts_segments: list, total_duration: float,
                         temp_dir: str, keep_bg: bool = False,
                         original_audio_path: str = None,
-                        extend_video: bool = False) -> str:
+                        extend_video: bool = False) -> tuple:
     """
     Build the final dubbed audio track by placing TTS segments at correct
     timestamps.
@@ -1335,7 +1369,9 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     If extend_video=False: clips are speed-adjusted and truncated to fit
     the original video timeline (legacy behavior).
 
-    Returns path to the final mixed audio WAV.
+    Returns: (path to the final mixed audio WAV, list of video_shift_points)
+    video_shift_points: list of (timestamp, freeze_duration) tuples for
+    per-gap freeze frames, or empty list if not extending.
     """
     print(f"  [5/5] Building dubbed audio track...")
 
@@ -1484,6 +1520,7 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     # In extend_video mode, clips that overlap get pushed later.
     # In legacy mode, start times are original.
     actual_starts = []
+    video_shift_points = []  # (timestamp_in_original, freeze_duration)
     if extend_video:
         running_shift = 0.0
         for ci, (seg, adj_path) in enumerate(adjusted_clips):
@@ -1499,8 +1536,13 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 if actual_end > next_actual_start:
                     overlap = actual_end - next_actual_start + 0.05
                     running_shift += overlap
+                    # Record shift point: freeze at the end of this clip's
+                    # original segment, for `overlap` seconds
+                    freeze_ts = float(seg["end"])
+                    video_shift_points.append((freeze_ts, overlap))
         if running_shift > 0:
             print(f"        Total timeline extension: {running_shift:.1f}s (video will freeze-frame)")
+            print(f"        Shift points: {[(f'{t:.1f}s', f'{d:.1f}s') for t,d in video_shift_points[:5]]}")
     else:
         for seg, adj_path in adjusted_clips:
             actual_starts.append(float(seg["start"]))
@@ -1609,9 +1651,9 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 for p in [mixed_path, bg_path]:
                     if os.path.exists(p):
                         os.remove(p)
-                return final_path
+                return (final_path, video_shift_points)
 
-        return mixed_path
+        return (mixed_path, video_shift_points)
     else:
         # Clean up intermediate adjusted clips to save disk on long videos
         # (the mixed audio is the final output, adjusted clips no longer needed)
@@ -1628,7 +1670,7 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                     os.remove(os.path.join(temp_dir, f))
                 except Exception:
                     pass
-        return mixed_path
+        return (mixed_path, video_shift_points)
 
 
 # ---------------------------------------------------------------------------
@@ -1637,11 +1679,15 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
 
 def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                     burn_subtitles: bool = False, srt_path: str = None,
-                    extend_video: bool = False) -> float:
+                    extend_video: bool = False,
+                    video_shift_points: list = None) -> float:
     """Replace video's audio with dubbed audio, optionally burn subtitles.
     
-    If extend_video=True: extends the video by freeze-framing the last frame
-    to match the audio duration. The video is NOT cut short.
+    If extend_video=True: extends the video to match the audio duration.
+    If video_shift_points is provided: inserts freeze-frames at each shift
+    point (list of (timestamp, freeze_duration) tuples) so the video
+    freezes at the right moments instead of just extending the last frame.
+    Otherwise: freeze-frames the last frame to match audio duration.
     Returns the duration of the output file."""
     print(f"  [final] Muxing video with dubbed audio...")
 
@@ -1666,41 +1712,190 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
         extra_dur = audio_dur - video_dur
         print(f"        Video: {video_dur:.1f}s, Audio: {audio_dur:.1f}s → extending video by {extra_dur:.1f}s")
         
-        # Strategy: extract last frame, create a frozen frame video segment,
-        # concat with original video, then mux audio
-        # Use tpad filter which freezes the last frame for extra_dur seconds
-        
-        if burn_subtitles and srt_path and os.path.exists(srt_path):
-            escaped_srt = srt_path.replace("'", r"'\''")
-            # tpad=stop_mode=clone:stop_duration=X extends the last frame
-            vf = f"subtitles='{escaped_srt}',tpad=stop_mode=clone:stop_duration={extra_dur:.3f}"
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-                   "-map", "0:v", "-map", "1:a",
-                   "-c:v", "libx264", "-crf", "20",
-                   "-vf", vf,
-                   "-c:a", "aac", "-b:a", "192k",
-                   output_path]
+        # If we have shift points, build a video with freeze-frames at each
+        # gap point. Otherwise, just freeze the last frame (simple tpad).
+        if video_shift_points:
+            # Build extended video using concat: for each shift point, 
+            # extract the frame at that timestamp, create a freeze-frame
+            # segment, and concat everything together.
+            # This gives a natural look — video pauses where the audio 
+            # was extended.
+            print(f"        Building video with {len(video_shift_points)} freeze-frame points...")
+            
+            temp_vdir = tempfile.mkdtemp(prefix="video_extend_")
+            try:
+                # Build a complex filter that:
+                # 1. Splits the video at each shift point
+                # 2. Inserts freeze frames at each point
+                # 3. Concats everything back
+                #
+                # Using FFmpeg's setpts + tpad approach for each segment
+                # 
+                # Simpler approach: use setpts to shift video timestamps
+                # and tpad to add freeze frames at each gap
+                
+                # Sort shift points by timestamp
+                sorted_shifts = sorted(video_shift_points, key=lambda x: x[0])
+                
+                # Build filter: for each shift point, freeze the frame at
+                # that timestamp for the shift duration
+                # We use the trim + tpad + concat approach
+                #
+                # Actually, the simplest reliable approach:
+                # 1. Extract the video into segments at shift points
+                # 2. After each segment, add a freeze frame for the shift duration
+                # 3. Concat all segments + freeze frames
+                
+                segments = []
+                prev_ts = 0.0
+                for ts, freeze_dur in sorted_shifts:
+                    if ts > prev_ts:
+                        segments.append(("video", prev_ts, ts))
+                    if freeze_dur > 0.01:
+                        segments.append(("freeze", ts, freeze_dur))
+                    prev_ts = ts
+                
+                # Add remaining video after last shift
+                if prev_ts < video_dur:
+                    segments.append(("video", prev_ts, video_dur))
+                
+                # If total is still less than audio, add final freeze
+                total_planned = sum(s[2]-s[1] if s[0]=="video" else s[2] for s in segments)
+                if total_planned < audio_dur:
+                    final_freeze = audio_dur - total_planned
+                    segments.append(("freeze", video_dur, final_freeze))
+                
+                # Build each segment as a separate file, then concat
+                concat_list = os.path.join(temp_vdir, "concat.txt")
+                with open(concat_list, "w") as f:
+                    seg_idx = 0
+                    for seg in segments:
+                        seg_path = os.path.join(temp_vdir, f"seg_{seg_idx:04d}.mp4")
+                        seg_idx += 1
+                        if seg[0] == "video":
+                            _, start, end = seg
+                            # Extract this segment of the video
+                            cmd = ["ffmpeg", "-y", "-i", video_path,
+                                   "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                                   "-c:v", "libx264", "-crf", "20", "-an",
+                                   seg_path]
+                            subprocess.run(cmd, capture_output=True, text=True)
+                        else:
+                            _, ts, dur = seg
+                            # Extract frame at timestamp and create freeze segment
+                            frame_path = os.path.join(temp_vdir, f"frame_{seg_idx:04d}.png")
+                            extract_cmd = ["ffmpeg", "-y", "-i", video_path,
+                                          "-ss", f"{ts:.3f}", "-frames:v", "1",
+                                          frame_path]
+                            subprocess.run(extract_cmd, capture_output=True, text=True)
+                            if os.path.exists(frame_path):
+                                cmd = ["ffmpeg", "-y", "-loop", "1", "-i", frame_path,
+                                       "-t", f"{dur:.3f}", "-c:v", "libx264", "-crf", "20",
+                                       "-r", "25", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                                       seg_path]
+                                subprocess.run(cmd, capture_output=True, text=True)
+                        
+                        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                            f.write(f"file '{seg_path}'\n")
+                
+                # Concat all segments
+                extended_video = os.path.join(temp_vdir, "extended.mp4")
+                concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                             "-i", concat_list, "-c", "copy", extended_video]
+                result = subprocess.run(concat_cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0 and os.path.exists(extended_video):
+                    # Now mux with audio
+                    if burn_subtitles and srt_path and os.path.exists(srt_path):
+                        escaped_srt = srt_path.replace("'", r"'\''")
+                        cmd = ["ffmpeg", "-y", "-i", extended_video, "-i", audio_path,
+                               "-map", "0:v", "-map", "1:a",
+                               "-c:v", "copy",
+                               "-vf", f"subtitles='{escaped_srt}'",
+                               "-c:a", "aac", "-b:a", "192k",
+                               output_path]
+                    else:
+                        cmd = ["ffmpeg", "-y", "-i", extended_video, "-i", audio_path,
+                               "-map", "0:v", "-map", "1:a",
+                               "-c:v", "copy",
+                               "-c:a", "aac", "-b:a", "192k",
+                               output_path]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        pass  # success
+                    else:
+                        # Fallback: re-encode video
+                        cmd = ["ffmpeg", "-y", "-i", extended_video, "-i", audio_path,
+                               "-map", "0:v", "-map", "1:a",
+                               "-c:v", "libx264", "-crf", "20",
+                               "-c:a", "aac", "-b:a", "192k",
+                               output_path]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                else:
+                    # Concat failed, fall back to simple tpad
+                    print(f"        Segment concat failed, using simple tpad...")
+                    raise RuntimeError("concat failed")
+                    
+            except Exception as e:
+                print(f"        Per-gap freeze failed ({e!r}), using simple last-frame extend...")
+                # Fall back to simple tpad
+                if burn_subtitles and srt_path and os.path.exists(srt_path):
+                    escaped_srt = srt_path.replace("'", r"'\''")
+                    vf = f"subtitles='{escaped_srt}',tpad=stop_mode=clone:stop_duration={extra_dur:.3f}"
+                    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                           "-map", "0:v", "-map", "1:a",
+                           "-c:v", "libx264", "-crf", "20",
+                           "-vf", vf,
+                           "-c:a", "aac", "-b:a", "192k",
+                           output_path]
+                else:
+                    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                           "-map", "0:v", "-map", "1:a",
+                           "-c:v", "libx264", "-crf", "20",
+                           "-vf", f"tpad=stop_mode=clone:stop_duration={extra_dur:.3f}",
+                           "-c:a", "aac", "-b:a", "192k",
+                           output_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    cmd_fallback = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                                    "-map", "0:v", "-map", "1:a",
+                                    "-c:v", "libx264", "-crf", "20",
+                                    "-c:a", "aac", "-b:a", "192k",
+                                    output_path]
+                    result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"FFmpeg muxing failed:\n{result.stderr}")
         else:
-            # No subtitles — use tpad to extend, copy audio codec
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-                   "-map", "0:v", "-map", "1:a",
-                   "-c:v", "libx264", "-crf", "20",
-                   "-vf", f"tpad=stop_mode=clone:stop_duration={extra_dur:.3f}",
-                   "-c:a", "aac", "-b:a", "192k",
-                   output_path]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            # Fallback without tpad
-            print(f"        tpad failed, trying alternate approach...")
-            cmd_fallback = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-                            "-map", "0:v", "-map", "1:a",
-                            "-c:v", "libx264", "-crf", "20",
-                            "-c:a", "aac", "-b:a", "192k",
-                            output_path]
-            result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+            # Simple: just freeze the last frame
+            if burn_subtitles and srt_path and os.path.exists(srt_path):
+                escaped_srt = srt_path.replace("'", r"'\''")
+                vf = f"subtitles='{escaped_srt}',tpad=stop_mode=clone:stop_duration={extra_dur:.3f}"
+                cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-crf", "20",
+                       "-vf", vf,
+                       "-c:a", "aac", "-b:a", "192k",
+                       output_path]
+            else:
+                cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-crf", "20",
+                       "-vf", f"tpad=stop_mode=clone:stop_duration={extra_dur:.3f}",
+                       "-c:a", "aac", "-b:a", "192k",
+                       output_path]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                raise RuntimeError(f"FFmpeg muxing failed:\n{result.stderr}")
+                # Fallback without tpad
+                print(f"        tpad failed, trying alternate approach...")
+                cmd_fallback = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                                "-map", "0:v", "-map", "1:a",
+                                "-c:v", "libx264", "-crf", "20",
+                                "-c:a", "aac", "-b:a", "192k",
+                                output_path]
+                result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"FFmpeg muxing failed:\n{result.stderr}")
     else:
         # Standard mux (audio fits within video or extend not requested)
         if burn_subtitles and srt_path and os.path.exists(srt_path):
@@ -2085,7 +2280,7 @@ def dub_video(
         if ckpt is None or ckpt["stage"] < 5:
             log(5, f"  [5/5] Building dubbed audio track...", 0, 1)
             bg_audio_path = audio_wav if keep_background else None
-            final_audio = build_dubbed_audio(
+            final_audio, video_shift_points = build_dubbed_audio(
                 tts_segments, total_duration, temp_dir,
                 keep_bg=keep_background,
                 original_audio_path=bg_audio_path,
@@ -2103,12 +2298,14 @@ def dub_video(
         else:
             log(5, f"   ✅ Stage 5 already done (dubbed audio built)", 1, 1)
             final_audio = ckpt["final_audio"]
+            video_shift_points = []  # not available from checkpoint
 
         # --- Stage 6: Mux ---
         log(6, f"  [final] Muxing video with dubbed audio...", 0, 1)
         out_dur = mux_video_audio(video_path, final_audio, output_path,
                         burn_subtitles=burn_subtitles, srt_path=srt_path,
-                        extend_video=extend_video)
+                        extend_video=extend_video,
+                        video_shift_points=video_shift_points)
         log(6, f"Muxing complete (output: {out_dur:.1f}s)", 1, 1)
 
         # Clean up checkpoint
