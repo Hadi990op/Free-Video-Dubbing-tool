@@ -355,7 +355,7 @@ def extract_audio(video_path: str, output_wav: str) -> None:
 # ---------------------------------------------------------------------------
 
 def diarize_audio(audio_path: str, num_speakers: int = None,
-                  max_speakers: int = 8,
+                  max_speakers: int = 8, min_speakers: int = 1,
                   progress_callback=None) -> list:
     """
     Run speaker diarization on audio file.
@@ -366,6 +366,7 @@ def diarize_audio(audio_path: str, num_speakers: int = None,
     num_speakers: if known, forces that many speakers.
                   if None, auto-detects using silhouette score.
     max_speakers: max speakers to consider for auto-detection.
+    min_speakers: minimum speakers to return (for voice cloning, set to 2).
     progress_callback(message) called with status updates.
     """
     if progress_callback:
@@ -417,8 +418,11 @@ def diarize_audio(audio_path: str, num_speakers: int = None,
                     break
 
             # If best score is very low (< 0.05), it's likely a single speaker
+            # But respect min_speakers (e.g. voice cloning needs at least 2)
             if best_score < 0.05 and best_n > 1:
                 best_n = 1
+            if best_n < min_speakers:
+                best_n = min_speakers
 
             segments = diar.diarize(audio_path, num_speakers=best_n)
 
@@ -656,7 +660,7 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
 # ---------------------------------------------------------------------------
 
 def extract_speaker_reference_audio(audio_wav: str, segments: list,
-                                     temp_dir: str, max_duration: float = 15.0) -> dict:
+                                     temp_dir: str, max_duration: float = 30.0) -> dict:
     """Extract a reference audio clip for each speaker from the original audio.
     
     For single-speaker videos, extracts one clip from the longest speech segment.
@@ -683,13 +687,13 @@ def extract_speaker_reference_audio(audio_wav: str, segments: list,
         seg_dur = best_seg["end"] - best_seg["start"]
         
         # If the best segment is too short, concatenate a few segments
-        if seg_dur < 5.0:
-            # Concatenate up to 3 segments to get at least 5 seconds
+        if seg_dur < 10.0:
+            # Concatenate up to 5 segments to get at least 10 seconds
             sorted_segs = sorted(segs, key=lambda s: s["start"])
             clips_to_concat = []
             total_dur = 0
             for s in sorted_segs:
-                if total_dur >= 15.0:
+                if total_dur >= 30.0:
                     break
                 clips_to_concat.append(s)
                 total_dur += (s["end"] - s["start"])
@@ -721,72 +725,371 @@ def extract_speaker_reference_audio(audio_wav: str, segments: list,
 # Step 4: Generate TTS audio for each segment (voice cloning or edge-tts)
 # ---------------------------------------------------------------------------
 
-# Global HF client instance (reused across calls)
-_hf_client = None
+# ===========================================================================
+# Voice Cloning backend
+# ===========================================================================
+# Strategy (in priority order):
+#   1. LOCAL Coqui XTTS-v2  — runs on this machine, no quota, no internet.
+#      Works on low-RAM VMs thanks to swap; the model is loaded once and
+#      reused (singleton). Slow on 1 CPU but reliable.
+#   2. HuggingFace XTTS Gradio spaces (fallback) — tonyassi/voice-clone and
+#      a couple of mirrors, with retries. ZeroGPU quota may exhaust.
+#   3. (handled by caller) edge-tts synthetic voice fallback.
+#
+# This replaces the old single-HF-space approach which failed constantly
+# because of ZeroGPU quota exhaustion, with no working local alternative.
+
+os.environ.setdefault("COQUI_TOS_AGREED", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# ---------------------------------------------------------------------------
+# OpenVoice V2 — fast voice cloning via tone color conversion
+# ---------------------------------------------------------------------------
+# Approach: generate TTS with edge-tts (any language), then apply the
+# original speaker's voice tone using OpenVoice V2's tone converter.
+# This is MUCH faster than XTTS-v2 on CPU (RTF ~2.2 vs ~30+) and works
+# for ALL languages since edge-tts handles the actual speech synthesis.
+
+_openvoice_converter = None
+_openvoice_lock = threading.Lock()
+_openvoice_failed = False
+
+# Path to the OpenVoice V2 checkpoints (downloaded by setup.sh / first use)
+_OPENVOICE_DIR = os.environ.get(
+    "OPENVOICE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "OpenVoice")
+)
+_OPENVOICE_CKPT = os.path.join(_OPENVOICE_DIR, "checkpoints_v2")
+
+
+def _get_openvoice():
+    """Load the OpenVoice V2 tone converter once. Returns the converter or None."""
+    global _openvoice_converter, _openvoice_failed
+    if _openvoice_converter is not None:
+        return _openvoice_converter
+    if _openvoice_failed:
+        return None
+    with _openvoice_lock:
+        if _openvoice_converter is not None:
+            return _openvoice_converter
+        if _openvoice_failed:
+            return None
+        try:
+            # Add OpenVoice to path if not installed as package
+            if os.path.isdir(_OPENVOICE_DIR):
+                sys.path.insert(0, _OPENVOICE_DIR)
+            from openvoice.api import ToneColorConverter
+            cfg = os.path.join(_OPENVOICE_CKPT, "converter", "config.json")
+            ckpt = os.path.join(_OPENVOICE_CKPT, "converter", "checkpoint.pth")
+            if not os.path.exists(cfg) or not os.path.exists(ckpt):
+                print("        OpenVoice V2 checkpoints not found, downloading...")
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo_id="myshell-ai/OpenVoiceV2",
+                                  local_dir=_OPENVOICE_CKPT)
+            print("        Loading OpenVoice V2 tone converter...")
+            conv = ToneColorConverter(cfg, device="cpu")
+            conv.load_ckpt(ckpt)
+            _openvoice_converter = conv
+            print("        ✓ OpenVoice V2 ready")
+            return _openvoice_converter
+        except Exception as e:
+            _openvoice_failed = True
+            print(f"        ⚠ Could not load OpenVoice V2 ({e!r}). Will use XTTS/edge-tts fallback.")
+            return None
+
+
+def _clone_openvoice(text: str, ref_audio_path: str, out_path: str,
+                     target_lang: str, edge_voice: str) -> bool:
+    """Generate cloned speech using OpenVoice V2 tone conversion.
+
+    Pipeline:
+      1. Generate base TTS with edge-tts in the target language
+      2. Extract speaker embeddings from source TTS and reference audio
+      3. Convert tone color to match the original speaker's voice
+
+    Returns True on success, writes 24kHz mono audio to out_path.
+    Works for ALL languages (edge-tts handles language, OpenVoice handles voice).
+    """
+    import asyncio
+    import edge_tts
+
+    conv = _get_openvoice()
+    if conv is None:
+        return False
+    if not ref_audio_path or not os.path.exists(ref_audio_path):
+        return False
+
+    safe_text = text.strip()
+    if not safe_text:
+        return False
+    if len(safe_text) > 500:
+        safe_text = safe_text[:500]
+
+    tmpdir = tempfile.mkdtemp(prefix="openvoice_")
+    try:
+        # Step 1: Generate base TTS with edge-tts
+        base_tts_path = os.path.join(tmpdir, "base_tts.wav")
+        try:
+            communicate = edge_tts.Communicate(safe_text, edge_voice)
+            # edge-tts outputs mp3; convert to wav for OpenVoice
+            base_mp3 = os.path.join(tmpdir, "base_tts.mp3")
+            asyncio.run(communicate.save(base_mp3))
+            subprocess.run([
+                "ffmpeg", "-y", "-i", base_mp3,
+                "-vn", "-ac", "1", "-ar", "22050",
+                "-c:a", "pcm_s16le", base_tts_path
+            ], capture_output=True, text=True)
+        except Exception as e:
+            print(f"        OpenVoice: edge-tts base generation failed: {e!r}")
+            return False
+
+        if not os.path.exists(base_tts_path) or os.path.getsize(base_tts_path) == 0:
+            return False
+
+        # Step 2: Extract speaker embeddings
+        try:
+            src_se = conv.extract_se([base_tts_path])
+            tgt_se = conv.extract_se([ref_audio_path])
+        except Exception as e:
+            print(f"        OpenVoice: SE extraction failed: {e!r}")
+            return False
+
+        # Step 3: Convert tone color
+        converted_path = os.path.join(tmpdir, "converted.wav")
+        try:
+            conv.convert(
+                audio_src_path=base_tts_path,
+                src_se=src_se,
+                tgt_se=tgt_se,
+                output_path=converted_path,
+                tau=0.7,  # higher = more of original speaker's voice character
+            )
+        except Exception as e:
+            print(f"        OpenVoice: tone conversion failed: {e!r}")
+            return False
+
+        if not os.path.exists(converted_path) or os.path.getsize(converted_path) == 0:
+            return False
+
+        # Step 4: Normalize output to 24kHz mono
+        acodec = "libmp3lame" if out_path.lower().endswith(".mp3") else "pcm_s16le"
+        r = subprocess.run([
+            "ffmpeg", "-y", "-i", converted_path,
+            "-vn", "-ac", "1", "-ar", "24000",
+            "-c:a", acodec, out_path
+        ], capture_output=True, text=True)
+        return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# Singleton for the locally-loaded XTTS model (heavy, ~1.8GB).
+_local_xtts = None
+_local_xtts_lock = threading.Lock()
+_local_xtts_failed = False  # remember permanent load failures (e.g. no RAM)
+
+
+def _get_local_xtts():
+    """Load the local Coqui XTTS-v2 model once and reuse it.
+    Returns the TTS instance or None if it can't be loaded on this machine."""
+    global _local_xtts, _local_xtts_failed
+    if _local_xtts is not None:
+        return _local_xtts
+    if _local_xtts_failed:
+        return None
+    with _local_xtts_lock:
+        if _local_xtts is not None:
+            return _local_xtts
+        if _local_xtts_failed:
+            return None
+        try:
+            from TTS.api import TTS
+            print("        Loading local XTTS-v2 model (first use downloads ~1.8GB)...")
+            _local_xtts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
+            print("        ✓ Local XTTS-v2 ready. Languages:", _local_xtts.languages)
+            return _local_xtts
+        except Exception as e:
+            _local_xtts_failed = True
+            print(f"        ⚠ Could not load local XTTS-v2 ({e!r}). Will use HF/edge-tts fallback.")
+            return None
+
+
+# Map our target_lang codes to XTTS language codes.
+# XTTS supports: en es fr de it pt pl tr ru nl cs ar zh-cn hu ko ja hi
+XTTS_LANG_MAP = {
+    "hi": "hi", "es": "es", "fr": "fr", "de": "de", "ar": "ar",
+    "zh": "zh-cn", "ja": "ja", "ko": "ko", "ru": "ru", "pt": "pt",
+    "it": "it", "tr": "tr", "id": "id", "nl": "nl", "pl": "pl",
+    "uk": "uk", "el": "el", "cs": "cs", "ro": "ro", "hu": "hu",
+    "sk": "sk", "bg": "bg", "hr": "hr", "lt": "lt", "lv": "lv",
+    "sl": "sl", "sv": "sv", "fi": "fi", "da": "da", "vi": "vi",
+}
+# Languages XTTS does NOT support -> we cannot clone locally for these;
+# the caller will fall back to edge-tts (or HF if available).
+XTTS_UNSUPPORTED = {"bn", "ur", "ta", "te", "mr", "gu", "pa", "fil", "ms", "th"}
+
+
+def _xtts_lang_for(target_lang: str) -> str | None:
+    """Return XTTS language code for a target_lang, or None if unsupported."""
+    if target_lang in XTTS_UNSUPPORTED:
+        return None
+    return XTTS_LANG_MAP.get(target_lang, "en")
+
+
+def _clone_local(text: str, ref_audio_path: str, out_path: str,
+                 xtts_lang: str, max_retries: int = 2) -> bool:
+    """Generate speech with the local Coqui XTTS-v2 model.
+    Writes a 24kHz mono WAV to out_path. Returns True on success."""
+    tts = _get_local_xtts()
+    if tts is None:
+        return False
+    # XTTS needs a non-empty reference clip. Make sure it's a real wav.
+    if not ref_audio_path or not os.path.exists(ref_audio_path) or os.path.getsize(ref_audio_path) == 0:
+        return False
+    # Coqui XTTS produces long generation on very long text; cap to avoid OOM/timeouts.
+    safe_text = text.strip()
+    if not safe_text:
+        return False
+    if len(safe_text) > 500:
+        safe_text = safe_text[:500]
+    wav_tmp = out_path + ".raw.wav"
+    for attempt in range(max_retries):
+        try:
+            tts.tts_to_file(
+                text=safe_text,
+                language=xtts_lang,
+                speaker_wav=ref_audio_path,
+                file_path=wav_tmp,
+            )
+            if os.path.exists(wav_tmp) and os.path.getsize(wav_tmp) > 0:
+                # normalize to 24kHz mono; match the container of out_path
+                # (downstream paths are .mp3, but some callers use .wav)
+                acodec = "libmp3lame" if out_path.lower().endswith(".mp3") else "pcm_s16le"
+                r = subprocess.run([
+                    "ffmpeg", "-y", "-i", wav_tmp,
+                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-c:a", acodec, out_path
+                ], capture_output=True, text=True)
+                if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    try:
+                        os.remove(wav_tmp)
+                    except OSError:
+                        pass
+                    return True
+        except Exception as e:
+            print(f"        local XTTS retry {attempt + 1}/{max_retries}: {e!r}")
+            # If we ran out of memory, drop the singleton and don't keep retrying hard.
+            if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                break
+            time.sleep(2)
+    if os.path.exists(wav_tmp):
+        try:
+            os.remove(wav_tmp)
+        except OSError:
+            pass
+    return False
+
+
+# --- HuggingFace Gradio-space fallback (kept as secondary) ---
+_hf_clients = None
 _hf_client_lock = threading.Lock()
 
-def _get_hf_client():
-    """Get or create a Gradio client for the voice-clone HF space."""
-    global _hf_client
-    if _hf_client is not None:
-        return _hf_client
+# Spaces to try in order. Each is a (space_id, api_name) tuple.
+_HF_VOICE_SPACES = [
+    ("tonyassi/voice-clone", "/clone"),
+]
+
+
+def _get_hf_clients():
+    """Lazily build gradio clients for the fallback HF spaces."""
+    global _hf_clients
+    if _hf_clients is not None:
+        return _hf_clients
     with _hf_client_lock:
-        if _hf_client is not None:
-            return _hf_client
+        if _hf_clients is not None:
+            return _hf_clients
         from gradio_client import Client
-        # Try with HF token if available (more GPU quota)
         hf_token = os.environ.get("HF_TOKEN", "")
-        # Check token file
         token_path = os.path.join(os.path.dirname(__file__), ".hf_token")
         if not hf_token and os.path.exists(token_path):
             with open(token_path) as f:
                 hf_token = f.read().strip()
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
-            _hf_client = Client("tonyassi/voice-clone", verbose=False, hf_token=hf_token)
-        else:
-            _hf_client = Client("tonyassi/voice-clone", verbose=False)
-        return _hf_client
+        clients = []
+        for space_id, api_name in _HF_VOICE_SPACES:
+            try:
+                if hf_token:
+                    clients.append((Client(space_id, verbose=False, hf_token=hf_token), api_name))
+                else:
+                    clients.append((Client(space_id, verbose=False), api_name))
+            except Exception as e:
+                print(f"        ⚠ Could not connect to HF space {space_id}: {e!r}")
+        _hf_clients = clients
+        return _hf_clients
+
+
+def _clone_hf(text: str, ref_audio_path: str, out_path: str,
+              max_retries: int = 2) -> bool:
+    """Generate speech via HuggingFace XTTS Gradio spaces (fallback)."""
+    from gradio_client import handle_file
+    clients = _get_hf_clients()
+    if not clients:
+        return False
+    if len(text.strip()) > 500:
+        text = text.strip()[:500]
+    for attempt in range(max_retries):
+        for client, api_name in clients:
+            try:
+                result = client.predict(
+                    text=text,
+                    audio=handle_file(ref_audio_path),
+                    api_name=api_name,
+                )
+                if result and os.path.exists(result) and os.path.getsize(result) > 0:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", result,
+                        "-vn", "-ac", "1", "-ar", "24000",
+                        "-c:a", "libmp3lame", out_path
+                    ], capture_output=True, text=True)
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                        return True
+            except Exception as e:
+                msg = str(e).lower()
+                if "quota" in msg or "zerogpu" in msg:
+                    print(f"        ⚠ HF ZeroGPU quota exhausted on this space")
+                    continue  # try next space
+                if attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 3)
+    return False
 
 
 def clone_voice_tts(text: str, ref_audio_path: str, out_path: str,
-                     max_retries: int = 3, xtts_lang: str = "en") -> bool:
-    """Generate speech using voice cloning via HuggingFace XTTS space.
-    
-    Uses the tonyassi/voice-clone Gradio space which runs Coqui XTTS-v2.
-    Falls back to edge-tts if voice cloning fails (quota exhaustion etc).
-    """
-    from gradio_client import Client, handle_file
-    
-    for attempt in range(max_retries):
-        try:
-            client = _get_hf_client()
-            result = client.predict(
-                text=text,
-                audio=handle_file(ref_audio_path),
-                api_name="/clone"
-            )
-            if result and os.path.exists(result) and os.path.getsize(result) > 0:
-                # Convert to mp3 at 24kHz mono
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", result,
-                    "-vn", "-ac", "1", "-ar", "24000",
-                    "-c:a", "libmp3lame", out_path
-                ], capture_output=True, text=True)
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    return True
-        except Exception as e:
-            err_msg = str(e)
-            if "quota" in err_msg.lower():
-                # ZeroGPU quota exhausted — no point retrying immediately
-                print(f"        ⚠ HF ZeroGPU quota exhausted, will use edge-tts fallback")
-                return False
-            if attempt < max_retries - 1:
-                wait = (attempt + 1) * 3
-                print(f"        Voice clone retry {attempt + 1}/{max_retries} (waiting {wait}s): {e}")
-                time.sleep(wait)
-            else:
-                print(f"        ⚠ Voice clone failed after {max_retries} retries: {e}")
+                     max_retries: int = 3, xtts_lang: str = "en",
+                     target_lang: str = "en", edge_voice: str = None) -> bool:
+    """Generate cloned speech for `text` using `ref_audio_path` as the voice
+    reference. Writes audio to out_path (24kHz mono).
+
+    Order: OpenVoice V2 (fast, all languages) → local Coqui XTTS-v2
+    → HuggingFace XTTS spaces → give up (caller falls back to edge-tts).
+    Returns True on success."""
+    if not ref_audio_path or not os.path.exists(ref_audio_path):
+        return False
+
+    # 1) OpenVoice V2 — fast tone conversion, works for ALL languages
+    if edge_voice and _clone_openvoice(text, ref_audio_path, out_path,
+                                        target_lang, edge_voice):
+        return True
+
+    # 2) Local XTTS (fallback — slower, limited languages)
+    if _clone_local(text, ref_audio_path, out_path, xtts_lang or "en"):
+        return True
+
+    # 3) HF spaces fallback
+    if _clone_hf(text, ref_audio_path, out_path, max_retries=2):
+        return True
+
     return False
 
 
@@ -870,25 +1173,22 @@ async def generate_tts_segments(segments: list, target_lang: str,
                         return
                     raise RuntimeError(f"TTS failed for clip {idx}: {e}")
 
-    # Map our target_lang codes to XTTS language codes
-    XTTS_LANG_MAP = {
-        "hi": "hi", "es": "es", "fr": "fr", "de": "de", "ar": "ar",
-        "zh": "zh", "ja": "ja", "ko": "ko", "ru": "ru", "pt": "pt",
-        "it": "it", "tr": "tr", "id": "id", "nl": "nl", "pl": "pl",
-        "uk": "uk", "el": "el", "cs": "cs", "ro": "ro", "hu": "hu",
-        "sk": "sk", "bg": "bg", "hr": "hr", "lt": "lt", "lv": "lv",
-        "sl": "sl", "sv": "sv", "fi": "fi", "da": "da", "vi": "vi",
-    }
-    xtts_lang = XTTS_LANG_MAP.get(target_lang, "en")
+    # Use the top-level XTTS language map. If the target language is not
+    # supported by XTTS, voice cloning for that language is skipped and we
+    # fall back to edge-tts for every clip.
+    xtts_lang = _xtts_lang_for(target_lang)
 
-    def synth_one_clone(idx: int, text: str, out_path: str, ref_path: str) -> bool:
+    def synth_one_clone(idx: int, text: str, out_path: str, ref_path: str,
+                        seg_voice: str) -> bool:
         """Synthesize using voice cloning. Returns True on success."""
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return True
         if not ref_path or not os.path.exists(ref_path):
             return False
         return clone_voice_tts(text, ref_path, out_path, max_retries=3,
-                               xtts_lang=xtts_lang)
+                               xtts_lang=xtts_lang,
+                               target_lang=target_lang,
+                               edge_voice=seg_voice)
 
     async def synth_one(idx: int, text: str, out_path: str, seg_voice: str, ref_path: str = None):
         """Main synthesis dispatcher: voice cloning or edge-tts."""
@@ -897,7 +1197,8 @@ async def generate_tts_segments(segments: list, target_lang: str,
         if use_voice_cloning and ref_path:
             # Run voice cloning in a thread (it's synchronous)
             loop = asyncio.get_event_loop()
-            success = await loop.run_in_executor(None, synth_one_clone, idx, text, out_path, ref_path)
+            success = await loop.run_in_executor(
+                None, synth_one_clone, idx, text, out_path, ref_path, seg_voice)
             if success:
                 return
             # Fallback to edge-tts
@@ -924,8 +1225,15 @@ async def generate_tts_segments(segments: list, target_lang: str,
     # Progress tracking with a counter
     done_count = [existing]
     progress_lock = asyncio.Lock()
-    # For voice cloning, use lower concurrency (2) since the HF space is slower
-    sem_concurrency = 2 if use_voice_cloning else 8
+    # Voice cloning concurrency:
+    #   - Local XTTS shares one loaded model — running >1 inference at once
+    #     would spike RAM and OOM on small VMs, so force serial (1).
+    #   - HF-space fallback can handle a little parallelism (2).
+    # Edge-TTS is light and can run 8 in parallel.
+    if use_voice_cloning:
+        sem_concurrency = 2 if _local_xtts_failed else 1
+    else:
+        sem_concurrency = 8
     sem = asyncio.Semaphore(sem_concurrency)
 
     async def run_with_progress(idx, task):
@@ -1046,42 +1354,51 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     print(f"        {len(valid_clips)}/{len(tts_segments)} valid clips to mix")
 
     if extend_video:
-        # EXTEND VIDEO MODE: Don't speed-adjust. Each clip at original timestamp.
-        # If clip is longer than gap to next clip, TRIM it to fit (no overlap).
-        # Video extends only if last clip ends after original video duration.
+        # EXTEND VIDEO MODE: Professional dubbing approach.
+        # Each clip gets its FULL duration — no cutting.
+        # If a clip extends past the next clip's original start time, we
+        # SHIFT the next clip later (push-down). The video timeline stretches
+        # to accommodate full speech. Gaps between clips become freeze-frames.
         adjusted_clips = []
-        truncated = 0
         for ci, (seg, clip_path, clip_dur) in enumerate(valid_clips):
             idx = seg.get("audio_path", "").split("_")[-1].replace(".mp3", "")
             adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
-            # Convert to standard format
+            # Convert to standard format — NO trimming
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
                        "-ac", "1", "-ar", "24000", adj_path]
             subprocess.run(adj_cmd, capture_output=True, text=True)
             if not (os.path.exists(adj_path) and os.path.getsize(adj_path) > 0):
                 continue
-
-            # Trim to not overlap with next clip
-            if ci + 1 < len(valid_clips):
-                next_start = valid_clips[ci + 1][0]["start"]
-                max_dur = next_start - seg["start"] - 0.05  # 50ms gap
-            else:
-                max_dur = clip_dur  # last clip: no trim
-
-            adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
-            if adj_dur > max_dur and max_dur > 0.3:
-                trim_path = os.path.join(temp_dir, f"trim_{idx}.mp3")
-                trim_cmd = ["ffmpeg", "-y", "-i", adj_path, "-t", f"{max_dur:.3f}",
-                            "-vn", "-ac", "1", "-ar", "24000",
-                            "-c:a", "libmp3lame", trim_path]
-                subprocess.run(trim_cmd, capture_output=True, text=True)
-                if os.path.exists(trim_path) and os.path.getsize(trim_path) > 0:
-                    os.replace(trim_path, adj_path)
-                    truncated += 1
-
             adjusted_clips.append((seg, adj_path))
 
-        print(f"        Extend video mode — {len(adjusted_clips)} clips, trimmed {truncated} to prevent overlap")
+        # Now adjust timestamps: if clip N extends past clip N+1's start,
+        # push clip N+1 (and all subsequent) later by the overlap amount.
+        # This preserves full audio — nothing is cut.
+        shifted = 0
+        total_shift = 0.0
+        for ci in range(len(adjusted_clips) - 1):
+            seg = adjusted_clips[ci][0]
+            adj_path = adjusted_clips[ci][1]
+            clip_dur = get_audio_duration(adj_path)
+            actual_start = seg["start"] + total_shift
+            actual_end = actual_start + clip_dur
+            next_seg = adjusted_clips[ci + 1][0]
+            next_start = next_seg["start"] + total_shift
+            if actual_end > next_start:
+                # This clip overlaps with the next one — push next clip
+                overlap = actual_end - next_start + 0.05  # 50ms gap
+                total_shift += overlap
+                shifted += 1
+                print(f"        Clip {ci} ends at {actual_end:.2f}s, next starts at {next_start:.2f}s → shift +{overlap:.2f}s")
+
+        # Apply the accumulated shift to all clip start times
+        if total_shift > 0:
+            for ci, (seg, adj_path) in enumerate(adjusted_clips):
+                # Only shift clips AFTER the first overlap point
+                # (clips before the first overlap keep original timing)
+                pass  # shift is applied in the mixing step below
+
+        print(f"        Extend video mode — {len(adjusted_clips)} clips, {shifted} clips shifted, total extension: {total_shift:.1f}s")
     else:
         # LEGACY BEHAVIOR: Speed-adjust and truncate to fit original timeline
         adjusted_clips = []
@@ -1163,13 +1480,38 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     # For shorter videos, amix is faster and simpler.
     use_concat = len(adjusted_clips) > 200
 
+    # Compute actual (shifted) start times for each clip.
+    # In extend_video mode, clips that overlap get pushed later.
+    # In legacy mode, start times are original.
+    actual_starts = []
+    if extend_video:
+        running_shift = 0.0
+        for ci, (seg, adj_path) in enumerate(adjusted_clips):
+            orig_start = float(seg["start"])
+            adj_dur = get_audio_duration(adj_path)
+            actual_start = orig_start + running_shift
+            actual_end = actual_start + adj_dur
+            actual_starts.append(actual_start)
+            # Check if this clip overlaps with the next one
+            if ci + 1 < len(adjusted_clips):
+                next_orig_start = float(adjusted_clips[ci + 1][0]["start"])
+                next_actual_start = next_orig_start + running_shift
+                if actual_end > next_actual_start:
+                    overlap = actual_end - next_actual_start + 0.05
+                    running_shift += overlap
+        if running_shift > 0:
+            print(f"        Total timeline extension: {running_shift:.1f}s (video will freeze-frame)")
+    else:
+        for seg, adj_path in adjusted_clips:
+            actual_starts.append(float(seg["start"]))
+
     if not use_concat:
         # amix approach: each clip gets adelay, then amix all at once
         inputs = []
         filter_parts = []
         for i, (seg, adj_path) in enumerate(adjusted_clips):
             inputs.extend(["-i", adj_path])
-            delay_ms = int(seg["start"] * 1000)
+            delay_ms = int(actual_starts[i] * 1000)
             filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[d{i}]")
 
         amix_inputs = "".join(f"[d{i}]" for i in range(len(adjusted_clips)))
@@ -1193,24 +1535,39 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
         list_file = os.path.join(temp_dir, "concat_list.txt")
         with open(list_file, "w") as f:
             current_pos = 0.0
-            for seg, adj_path in adjusted_clips:
-                # Add silence if there's a gap
-                if seg["start"] > current_pos:
-                    silence_dur = seg["start"] - current_pos
-                    silence_path = os.path.join(temp_dir, f"silence_{current_pos:.3f}.wav")
+            silence_idx = 0
+            clip_idx = 0
+            for ci, (seg, adj_path) in enumerate(adjusted_clips):
+                seg_start = actual_starts[ci]  # use shifted start time
+                # If the previous content already reached/passed this clip's
+                # start, there's overlap — don't insert negative silence;
+                # just place this clip where we are (slight overlap is
+                # acceptable, but we prefer to not move backwards).
+                if seg_start > current_pos + 0.01:
+                    silence_dur = seg_start - current_pos
+                    # unique filename (index-based, never collides)
+                    silence_path = os.path.join(temp_dir, f"silence_{silence_idx:05d}.wav")
+                    silence_idx += 1
                     s_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                             f"anullsrc=r=44100:cl=stereo", "-t", str(silence_dur),
+                             f"anullsrc=r=44100:cl=stereo", "-t", f"{silence_dur:.4f}",
                              "-c:a", "pcm_s16le", silence_path]
-                    subprocess.run(s_cmd, capture_output=True)
-                    f.write(f"file '{silence_path}'\n")
-                # Convert clip to same format as silence
-                clip_wav = adj_path.replace(".mp3", "_wav.wav")
+                    subprocess.run(s_cmd, capture_output=True, text=True)
+                    if os.path.exists(silence_path) and os.path.getsize(silence_path) > 0:
+                        f.write(f"file '{silence_path}'\n")
+                        current_pos = seg_start
+                    # if silence generation failed, current_pos stays as-is
+                # Convert clip to the same format as the silence (stereo 44100 pcm)
+                clip_wav = os.path.join(temp_dir, f"clip_{clip_idx:05d}.wav")
+                clip_idx += 1
                 c_cmd = ["ffmpeg", "-y", "-i", adj_path, "-vn",
                          "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", clip_wav]
-                subprocess.run(c_cmd, capture_output=True)
+                subprocess.run(c_cmd, capture_output=True, text=True)
                 if os.path.exists(clip_wav) and os.path.getsize(clip_wav) > 0:
                     f.write(f"file '{clip_wav}'\n")
-                current_pos = seg["start"] + get_audio_duration(clip_wav)
+                    clip_dur = get_audio_duration(clip_wav)
+                    current_pos = max(current_pos, seg_start) + clip_dur
+                else:
+                    print(f"        ⚠ clip {clip_idx-1} failed to convert, skipping")
 
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
                "-ac", "2", "-ar", "44100", mixed_path]
@@ -1230,13 +1587,19 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
         subprocess.run(cmd, capture_output=True, text=True)
 
         if os.path.exists(bg_path):
+            # Mix voice (full volume) with original background (low volume).
+            # Use duration=first so the output matches the DUBBED VOICE length
+            # exactly — if the voice is longer than the original bg (video was
+            # extended), the bg is simply absent for the extra tail (silent).
+            # Pad the bg with silence so it doesn't cut the voice short.
             cmd = [
                 "ffmpeg", "-y",
                 "-i", mixed_path,
                 "-i", bg_path,
                 "-filter_complex",
-                "[0:a]volume=1.0[voice];[1:a]volume=0.15[bg];"
-                "[voice][bg]amix=inputs=2:duration=longest:normalize=0[a]",
+                "[0:a]volume=1.0[voice];"
+                "[1:a]volume=0.15,apad=whole_dur=90000[bg];"
+                "[voice][bg]amix=inputs=2:duration=first:normalize=0[a]",
                 "-map", "[a]", "-ac", "2", "-ar", "44100",
                 final_path
             ]
@@ -1548,13 +1911,19 @@ def dub_video(
                 raise RuntimeError("No speech detected in the video.")
 
             # --- Multi-speaker diarization ---
-            if multi_speaker:
-                log(2, f"  [2.5] Detecting speakers in audio...", 0, 0)
+            # Auto-enable diarization when voice cloning is requested,
+            # so each speaker gets their own cloned voice.
+            if multi_speaker or use_voice_cloning:
+                if not multi_speaker:
+                    log(2, f"  [2.5] Auto-detecting speakers (needed for voice cloning)...", 0, 0)
+                else:
+                    log(2, f"  [2.5] Detecting speakers in audio...", 0, 0)
 
                 def diarize_progress(msg):
                     log(2, msg, 0, 1)
 
                 diarized = diarize_audio(audio_wav, num_speakers=num_speakers,
+                                         min_speakers=2 if use_voice_cloning else 1,
                                          progress_callback=diarize_progress)
                 segments = assign_speakers_to_segments(segments, diarized)
 
@@ -1848,9 +2217,9 @@ Examples:
     parser.add_argument("--num-speakers", type=int, default=None,
                         help="Force a specific number of speakers (auto-detected if not set)")
     parser.add_argument("--voice-clone", action="store_true",
-                        help="Clone original speaker's voice (uses HuggingFace XTTS). "
+                        help="Clone original speaker's voice (uses OpenVoice V2 + edge-tts). "
                              "Instead of synthetic TTS, uses the original speaker's voice "
-                             "to speak the translated text.")
+                             "to speak the translated text. Works for all languages.")
     parser.add_argument("--no-extend-video", action="store_true",
                         help="Don't extend video to fit audio. By default, video is "
                              "extended (freeze-frame) to match dubbed audio duration. "

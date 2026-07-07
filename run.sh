@@ -7,6 +7,10 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Required env vars for local voice cloning (Coqui XTTS-v2, non-commercial CPML)
+export COQUI_TOS_AGREED=1
+export HF_HUB_DISABLE_TELEMETRY=1
+
 # Activate virtual environment
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate

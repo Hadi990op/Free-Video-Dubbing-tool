@@ -196,12 +196,16 @@ Output Video ← Mux (ffmpeg) ← Build Audio ← TTS / Voice Cloning
 - Web UI shows "Resume" button for interrupted jobs
 
 ### Voice Cloning (Studio-Level)
-- Uses HuggingFace `tonyassi/voice-clone` space (Coqui XTTS-v2)
-- Extracts reference voice sample from each speaker's original audio
-- Generates translated speech in the original speaker's cloned voice
-- Falls back to edge-tts if voice cloning fails
-- Lower concurrency (2 vs 8) due to heavier computation
-- No API key required (free HuggingFace space)
+- **OpenVoice V2** (primary, MIT license, free for commercial use) — fast tone color conversion on CPU.
+  - Pipeline: edge-tts generates speech in target language → OpenVoice converts voice tone to match original speaker.
+  - Works for **ALL languages** (edge-tts handles the language, OpenVoice handles the voice).
+  - RTF ~2.2 on CPU (2.2x slower than real-time) — much faster than XTTS-v2 (which was ~30x slower).
+  - Model is lightweight (~200MB), loads in ~3 seconds.
+- **Coqui XTTS-v2** (fallback) — slower but higher quality for supported languages.
+  - The model (~1.8GB) is downloaded once and reused across runs (loaded as a singleton).
+  - Works on low-RAM VMs: `setup.sh` automatically creates a 4GB swap file so the model doesn't get OOM-killed.
+- **Fallback chain**: OpenVoice V2 → local XTTS-v2 → HuggingFace XTTS Gradio spaces → edge-tts synthetic voice. If cloning fails for a clip, it gracefully falls back instead of crashing.
+- Serial concurrency during voice cloning to keep memory bounded.
 
 ### Video Extension
 - When dubbed audio is longer than original video (common when translating from fast-speaking languages)
@@ -235,8 +239,9 @@ Free-Video-Dubbing-tool/
   - `small` model: ~3GB
   - `medium` model: ~5GB
   - `large` model: ~10GB
-- **Disk**: ~500MB for dependencies + space for video files
-- **CPU**: Works on CPU (GPU not required, but speeds up Whisper transcription)
+  - Voice cloning (XTTS-v2) needs ~1.8GB extra; `setup.sh` auto-creates 4GB swap on machines with <4GB RAM so it works on small VMs too.
+- **Disk**: ~500MB for dependencies + ~1.8GB for the XTTS model (downloaded once) + space for video files
+- **CPU**: Works on CPU (GPU not required, but speeds up Whisper transcription and voice cloning)
 
 ## 🐛 Troubleshooting
 
@@ -246,9 +251,11 @@ Free-Video-Dubbing-tool/
 | `No module named 'faster_whisper'` | `source venv/bin/activate` then `pip install -r requirements.txt` |
 | TTS sounds robotic | Try `--model small` for better transcription |
 | Audio out of sync | Enable `--extend-video` (default on) or try `--no-background` |
-| Voice cloning fails | Tool auto-falls back to edge-tts; check internet connection |
-| Out of memory | Use smaller model: `--model tiny` or `--model base` |
+| Voice cloning fails | Tool auto-falls back to edge-tts; ensure OpenVoice V2 is installed (run `bash setup.sh`) |
+| Voice cloning slow | OpenVoice V2 on CPU has RTF ~2.2 (1 min audio → ~2 min processing). This is normal for CPU. |
+| Out of memory | Use smaller model: `--model tiny` or `--model base`; ensure swap is enabled (`swapon --show`) |
 | Slow transcription | Use `--model tiny` or `--model base` (default) |
+| Slow voice cloning | Local XTTS on CPU is slow (esp. low-RAM VMs using swap); this is normal. First clip also loads the ~1.8GB model. |
 
 ## 📜 License
 
