@@ -2219,10 +2219,14 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             # Get clip duration for fade-out calculation
             clip_dur_s = get_audio_duration(adj_path)
             fade_out_start_s = max(clip_dur_s - FADE_OUT_MS / 1000.0, 0)
+            # IMPORTANT: fades must be applied BEFORE adelay, because afade's
+            # st= parameter is relative to the input stream's timeline. After
+            # adelay, the stream has silence prepended, so st=1.98s would point
+            # into the silence — killing all clips except the first.
             filter_parts.append(
-                f"[{i}:a]adelay={delay_ms}|{delay_ms},"
-                f"afade=t=in:st=0:d={FADE_IN_MS}ms,"
-                f"afade=t=out:st={fade_out_start_s:.4f}:d={FADE_OUT_MS}ms[d{i}]"
+                f"[{i}:a]afade=t=in:st=0:d={FADE_IN_MS}ms,"
+                f"afade=t=out:st={fade_out_start_s:.4f}:d={FADE_OUT_MS}ms,"
+                f"adelay={delay_ms}|{delay_ms}[d{i}]"
             )
 
         amix_inputs = "".join(f"[d{i}]" for i in range(len(adjusted_clips)))
