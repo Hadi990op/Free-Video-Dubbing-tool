@@ -1801,15 +1801,49 @@ async def generate_tts_segments(segments: list, target_lang: str,
         spk = seg.get("speaker", 0)
         return speaker_ref_audios.get(spk) or speaker_ref_audios.get(0)
 
-    async def synth_one_edge(idx: int, text: str, out_path: str, seg_voice: str):
-        """Synthesize using edge-tts."""
+    async def synth_one_edge(idx: int, text: str, out_path: str, seg_voice: str,
+                            target_duration: float = None):
+        """Synthesize using edge-tts.
+        If target_duration is set, adjusts rate to fit the target duration
+        (avoids atempo distortion — TTS generates at correct speed natively)."""
         # Skip if already generated (resume support)
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return
         max_retries = 3
+
+        # If we have a target duration, first generate at normal speed,
+        # measure the duration, then adjust rate and regenerate.
+        rate = "+0%"
+        if target_duration and target_duration > 0.5:
+            try:
+                # Quick generation to measure duration
+                probe_comm = edge_tts.Communicate(text, seg_voice)
+                probe_path = out_path + ".probe.mp3"
+                await probe_comm.save(probe_path)
+                if os.path.exists(probe_path) and os.path.getsize(probe_path) > 0:
+                    probe_dur = get_audio_duration(probe_path)
+                    os.remove(probe_path)
+                    if probe_dur > 0:
+                        # Calculate rate adjustment
+                        # rate=+50% means 1.5x speed (shorter)
+                        # rate=-50% means 0.5x speed (longer)
+                        ratio = probe_dur / target_duration
+                        # Clamp to reasonable range (0.7x to 1.5x)
+                        if ratio > 1.5:
+                            ratio = 1.5
+                        elif ratio < 0.7:
+                            ratio = 0.7
+                        # Convert ratio to percentage
+                        # ratio > 1 means we need to speed up (positive rate)
+                        # ratio < 1 means we need to slow down (negative rate)
+                        rate_pct = int((ratio - 1) * 100)
+                        rate = f"{'+' if rate_pct >= 0 else ''}{rate_pct}%"
+            except Exception:
+                pass  # Fall back to normal speed
+
         for attempt in range(max_retries):
             try:
-                communicate = edge_tts.Communicate(text, seg_voice)
+                communicate = edge_tts.Communicate(text, seg_voice, rate=rate)
                 await communicate.save(out_path)
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return
@@ -1846,7 +1880,8 @@ async def generate_tts_segments(segments: list, target_lang: str,
                                target_lang=target_lang,
                                edge_voice=seg_voice)
 
-    async def synth_one(idx: int, text: str, out_path: str, seg_voice: str, ref_path: str = None):
+    async def synth_one(idx: int, text: str, out_path: str, seg_voice: str,
+                       ref_path: str = None, target_duration: float = None):
         """Main synthesis dispatcher: voice cloning or edge-tts."""
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return
@@ -1859,7 +1894,7 @@ async def generate_tts_segments(segments: list, target_lang: str,
                 return
             # Fallback to edge-tts
             print(f"        ⚠ Voice clone failed for clip {idx}, falling back to edge-tts")
-        await synth_one_edge(idx, text, out_path, seg_voice)
+        await synth_one_edge(idx, text, out_path, seg_voice, target_duration)
 
     # Create all tasks
     for i, seg in enumerate(segments):
@@ -1901,7 +1936,8 @@ async def generate_tts_segments(segments: list, target_lang: str,
                     progress_callback(done_count[0], len(tts_segments))
 
     tasks_list = [run_with_progress(i, synth_one(i, seg["translated"], ts["audio_path"], ts["voice"],
-                                                   get_ref_audio_for_seg(seg)))
+                                                   get_ref_audio_for_seg(seg),
+                                                   target_duration=(seg["end"] - seg["start"])))
              for i, (seg, ts) in enumerate(zip(segments, tts_segments))]
 
     await asyncio.gather(*tasks_list)
