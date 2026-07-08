@@ -423,7 +423,7 @@ def separate_vocals(audio_path: str, temp_dir: str,
             capture_output=True, text=True
         )
         subprocess.run(
-            ["ffmpeg", "-y", "-i", no_vocals_path, "-vn", "-ac", "2", "-ar", "44100", no_vocals_44k],
+            ["ffmpeg", "-y", "-i", no_vocals_path, "-vn", "-ac", "2", "-ar", "48000", no_vocals_44k],
             capture_output=True, text=True
         )
 
@@ -1153,7 +1153,7 @@ def _clone_openvoice(text: str, ref_audio_path: str, out_path: str,
         acodec = "libmp3lame" if out_path.lower().endswith(".mp3") else "pcm_s16le"
         r = subprocess.run([
             "ffmpeg", "-y", "-i", converted_path,
-            "-vn", "-ac", "1", "-ar", "24000",
+            "-vn", "-ac", "2", "-ar", "48000",
             "-c:a", acodec, out_path
         ], capture_output=True, text=True)
         return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
@@ -1246,7 +1246,7 @@ def _clone_local(text: str, ref_audio_path: str, out_path: str,
                 acodec = "libmp3lame" if out_path.lower().endswith(".mp3") else "pcm_s16le"
                 r = subprocess.run([
                     "ffmpeg", "-y", "-i", wav_tmp,
-                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-vn", "-ac", "2", "-ar", "48000",
                     "-c:a", acodec, out_path
                 ], capture_output=True, text=True)
                 if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -1394,7 +1394,7 @@ def _clone_chatterbox(text: str, ref_audio_path: str, out_path: str,
             if result and os.path.exists(result) and os.path.getsize(result) > 0:
                 subprocess.run([
                     "ffmpeg", "-y", "-i", result,
-                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-vn", "-ac", "2", "-ar", "48000",
                     "-c:a", "libmp3lame", out_path
                 ], capture_output=True, text=True)
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -1473,7 +1473,7 @@ def _clone_indextts(text: str, ref_audio_path: str, out_path: str,
             if result and os.path.exists(result) and os.path.getsize(result) > 0:
                 subprocess.run([
                     "ffmpeg", "-y", "-i", result,
-                    "-vn", "-ac", "1", "-ar", "24000",
+                    "-vn", "-ac", "2", "-ar", "48000",
                     "-c:a", "libmp3lame", out_path
                 ], capture_output=True, text=True)
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -1525,7 +1525,7 @@ def _clone_hf(text: str, ref_audio_path: str, out_path: str,
                 if result and os.path.exists(result) and os.path.getsize(result) > 0:
                     subprocess.run([
                         "ffmpeg", "-y", "-i", result,
-                        "-vn", "-ac", "1", "-ar", "24000",
+                        "-vn", "-ac", "2", "-ar", "48000",
                         "-c:a", "libmp3lame", out_path
                     ], capture_output=True, text=True)
                     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -1658,7 +1658,7 @@ async def generate_tts_segments(segments: list, target_lang: str,
                 else:
                     print(f"        ⚠ TTS failed for clip {idx} after {max_retries} retries, using silence: {e}")
                     silence_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                                   "anullsrc=r=24000:cl=mono", "-t", "0.3",
+                                   "anullsrc=r=48000:cl=mono", "-t", "0.3",
                                    "-c:a", "libmp3lame", out_path]
                     subprocess.run(silence_cmd, capture_output=True)
                     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -1860,7 +1860,7 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
             # Convert to standard format — NO trimming
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                       "-ac", "1", "-ar", "24000", adj_path]
+                       "-ac", "2", "-ar", "48000", adj_path]
             subprocess.run(adj_cmd, capture_output=True, text=True)
             if not (os.path.exists(adj_path) and os.path.getsize(adj_path) > 0):
                 continue
@@ -1921,11 +1921,11 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                     ratio = 1.3
                 tempo = f"atempo={ratio:.4f}"
                 adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
-                           "-vn", "-ac", "1", "-ar", "24000", adj_path]
+                           "-vn", "-ac", "2", "-ar", "48000", adj_path]
                 r = subprocess.run(adj_cmd, capture_output=True, text=True)
                 if r.returncode != 0 or not os.path.exists(adj_path) or os.path.getsize(adj_path) == 0:
                     adj_cmd2 = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                                "-ac", "1", "-ar", "24000", adj_path]
+                                "-ac", "2", "-ar", "48000", adj_path]
                     subprocess.run(adj_cmd2, capture_output=True, text=True)
                 speed_adjusted += 1
             elif need_slowdown:
@@ -1936,23 +1936,23 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 tempo = atempo_filter(clip_dur, clip_dur / ratio)
                 if tempo:
                     adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
-                               "-vn", "-ac", "1", "-ar", "24000", adj_path]
+                               "-vn", "-ac", "2", "-ar", "48000", adj_path]
                     subprocess.run(adj_cmd, capture_output=True, text=True)
                 else:
                     adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                               "-ac", "1", "-ar", "24000", adj_path]
+                               "-ac", "2", "-ar", "48000", adj_path]
                     subprocess.run(adj_cmd, capture_output=True, text=True)
                 speed_adjusted += 1
             else:
                 adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                           "-ac", "1", "-ar", "24000", adj_path]
+                           "-ac", "2", "-ar", "48000", adj_path]
                 subprocess.run(adj_cmd, capture_output=True, text=True)
 
             adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
             if adj_dur > max_dur:
                 trim_path = os.path.join(temp_dir, f"trim_{idx}.mp3")
                 trim_cmd = ["ffmpeg", "-y", "-i", adj_path, "-t", f"{max_dur:.3f}",
-                            "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", trim_path]
+                            "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", trim_path]
                 subprocess.run(trim_cmd, capture_output=True, text=True)
                 if os.path.exists(trim_path) and os.path.getsize(trim_path) > 0:
                     os.replace(trim_path, adj_path)
@@ -2007,20 +2007,30 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             actual_starts.append(float(seg["start"]))
 
     if not use_concat:
-        # amix approach: each clip gets adelay, then amix all at once
+        # amix approach: each clip gets adelay + fade in/out, then amix all at once.
+        # Fades (30ms in, 20ms out) eliminate clicks/pops at clip boundaries.
+        FADE_IN_MS = 30   # 30ms fade-in
+        FADE_OUT_MS = 20  # 20ms fade-out
         inputs = []
         filter_parts = []
         for i, (seg, adj_path) in enumerate(adjusted_clips):
             inputs.extend(["-i", adj_path])
             delay_ms = int(actual_starts[i] * 1000)
-            filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[d{i}]")
+            # Get clip duration for fade-out calculation
+            clip_dur_s = get_audio_duration(adj_path)
+            fade_out_start_s = max(clip_dur_s - FADE_OUT_MS / 1000.0, 0)
+            filter_parts.append(
+                f"[{i}:a]adelay={delay_ms}|{delay_ms},"
+                f"afade=t=in:st=0:d={FADE_IN_MS}ms,"
+                f"afade=t=out:st={fade_out_start_s:.4f}:d={FADE_OUT_MS}ms[d{i}]"
+            )
 
         amix_inputs = "".join(f"[d{i}]" for i in range(len(adjusted_clips)))
         filter_complex = ";".join(filter_parts) + f";{amix_inputs}amix=inputs={len(adjusted_clips)}:duration=longest:normalize=0[a]"
 
         cmd = ["ffmpeg", "-y"] + inputs + [
             "-filter_complex", filter_complex,
-            "-map", "[a]", "-ac", "2", "-ar", "44100",
+            "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
             mixed_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -2050,7 +2060,7 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                     silence_path = os.path.join(temp_dir, f"silence_{silence_idx:05d}.wav")
                     silence_idx += 1
                     s_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                             f"anullsrc=r=44100:cl=stereo", "-t", f"{silence_dur:.4f}",
+                             f"anullsrc=r=48000:cl=stereo", "-t", f"{silence_dur:.4f}",
                              "-c:a", "pcm_s16le", silence_path]
                     subprocess.run(s_cmd, capture_output=True, text=True)
                     if os.path.exists(silence_path) and os.path.getsize(silence_path) > 0:
@@ -2060,8 +2070,12 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 # Convert clip to the same format as the silence (stereo 44100 pcm)
                 clip_wav = os.path.join(temp_dir, f"clip_{clip_idx:05d}.wav")
                 clip_idx += 1
+                # Convert clip with fade in/out to prevent clicks at boundaries
+                clip_dur_s = get_audio_duration(adj_path)
+                fade_out_st = max(clip_dur_s - 0.02, 0)
                 c_cmd = ["ffmpeg", "-y", "-i", adj_path, "-vn",
-                         "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", clip_wav]
+                         "-af", f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_st:.4f}:d=0.02",
+                         "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", clip_wav]
                 subprocess.run(c_cmd, capture_output=True, text=True)
                 if os.path.exists(clip_wav) and os.path.getsize(clip_wav) > 0:
                     f.write(f"file '{clip_wav}'\n")
@@ -2071,7 +2085,7 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                     print(f"        ⚠ clip {clip_idx-1} failed to convert, skipping")
 
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-               "-ac", "2", "-ar", "44100", mixed_path]
+               "-ac", "2", "-ar", "48000", "-sample_fmt", "s16", mixed_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Audio mixing (concat) failed:\n{result.stderr}")
@@ -2079,32 +2093,102 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     if not os.path.exists(mixed_path) or os.path.getsize(mixed_path) == 0:
         raise RuntimeError("Audio mixing produced empty output")
 
+    # Apply professional audio processing to the voice track:
+    # 1. High-pass filter (remove rumble below 80Hz)
+    # 2. De-essing (reduce harsh sibilance around 6-8kHz)
+    # 3. Gentle compression (even out volume, -18dB threshold, 3:1 ratio)
+    # 4. Subtle EQ boost for presence (2-4kHz) and warmth (200Hz)
+    # 5. Soft limiter to prevent clipping
+    processed_voice = os.path.join(temp_dir, "voice_processed.wav")
+    voice_filter = (
+        "highpass=f=80,"                                    # remove sub-bass rumble
+        "lowpass=f=15000,"                                  # remove harsh highs
+        "acompressor=threshold=-18dB:ratio=3:1:attack=5:release=80:makeup=2,"  # gentle compression
+        "equalizer=f=200:width_type=q:w=1:g=2,"            # warmth
+        "equalizer=f=3000:width_type=q:w=1.5:g=3,"         # presence/clarity
+        "equalizer=f=7000:width_type=q:w=2:g=-3,"           # de-ess
+        "alimiter=limit=0.95"                               # prevent clipping
+    )
+    proc_cmd = ["ffmpeg", "-y", "-i", mixed_path,
+                "-af", voice_filter,
+                "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
+                processed_voice]
+    proc_result = subprocess.run(proc_cmd, capture_output=True, text=True)
+    if proc_result.returncode == 0 and os.path.exists(processed_voice) and os.path.getsize(processed_voice) > 0:
+        # Replace mixed_path with processed version
+        os.replace(processed_voice, mixed_path)
+        print(f"        ✅ Professional audio processing applied (EQ, compression, de-ess, limiter)")
+    else:
+        print(f"        ⚠ Audio processing failed, using raw voice")
+        if os.path.exists(processed_voice):
+            os.remove(processed_voice)
+
     # Optionally mix with background audio from original
     if keep_bg and original_audio_path and os.path.exists(original_audio_path):
         final_path = os.path.join(temp_dir, "final_audio.wav")
         bg_path = os.path.join(temp_dir, "background.wav")
         cmd = ["ffmpeg", "-y", "-i", original_audio_path,
-               "-vn", "-ac", "2", "-ar", "44100", bg_path]
+               "-vn", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16", bg_path]
         subprocess.run(cmd, capture_output=True, text=True)
 
         if os.path.exists(bg_path):
-            # Mix voice (full volume) with original background (low volume).
-            # Use duration=first so the output matches the DUBBED VOICE length
-            # exactly — if the voice is longer than the original bg (video was
-            # extended), the bg is simply absent for the extra tail (silent).
-            # Pad the bg with silence so it doesn't cut the voice short.
+            # Professional sidechain ducking mix:
+            # The voice track automatically "ducks" (lowers) the background
+            # music whenever speech is present. This is exactly how
+            # professional radio/TV mixes work — music dips during dialogue
+            # and comes back up during pauses.
+            #
+            # Sidechain compression approach:
+            # - Background music runs through a compressor
+            # - The compressor's sidechain input is the voice track
+            # - When voice is present → compressor reduces bg volume
+            # - When voice is silent → bg returns to full volume
+            # - Attack/release smoothed for natural transitions
+            #
+            # Additional: EQ the background slightly to "make room" for voice
+            # by scooping the 1-4kHz range where speech lives.
+            duck_threshold = -20    # dB threshold for sidechain
+            duck_ratio = 6           # how much to duck (6:1 = strong duck)
+            duck_attack = 20          # ms — fast attack so bg ducks quickly
+            duck_release = 400        # ms — slow release so bg fades back gently
+            bg_base_volume = bg_volume  # base volume (0.35 for music, 0.15 for legacy)
+
+            filter_complex = (
+                # Split voice: one for sidechain control, one for final mix
+                "[0:a]asplit=2[voice_sc][voice_out];"
+                # Set base volume on background
+                f"[1:a]volume={bg_base_volume:.2f}[bg_vol];"
+                # Sidechain compress: voice controls bg ducking
+                f"[bg_vol][voice_sc]sidechaincompress="
+                f"threshold={duck_threshold}dB:ratio={duck_ratio}:"
+                f"attack={duck_attack}:release={duck_release}[bg_ducked];"
+                # Slight EQ on bg to carve space for voice (dip 2kHz)
+                "[bg_ducked]equalizer=f=2000:width_type=q:w=2:g=-3[bg_eq];"
+                # Mix voice + ducked bg
+                "[voice_out][bg_eq]amix=inputs=2:duration=first:normalize=0[a]"
+            )
             cmd = [
                 "ffmpeg", "-y",
-                "-i", mixed_path,
-                "-i", bg_path,
-                "-filter_complex",
-                f"[0:a]volume=1.0[voice];"
-                f"[1:a]volume={bg_volume:.2f},apad=whole_dur=90000[bg];"
-                "[voice][bg]amix=inputs=2:duration=first:normalize=0[a]",
-                "-map", "[a]", "-ac", "2", "-ar", "44100",
+                "-i", mixed_path,        # [0] voice (processed)
+                "-i", bg_path,           # [1] background music
+                "-filter_complex", filter_complex,
+                "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
                 final_path
             ]
             result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                # Fallback: simpler sidechain approach
+                print(f"        ⚠ Sidechain filter failed, trying simple ducking...")
+                filter_simple = (
+                    f"[1:a]volume={bg_volume:.2f},apad=whole_dur=90000[bg];"
+                    "[0:a]volume=1.0[voice];"
+                    "[voice][bg]amix=inputs=2:duration=first:normalize=0[a]"
+                )
+                cmd = ["ffmpeg", "-y", "-i", mixed_path, "-i", bg_path,
+                       "-filter_complex", filter_simple,
+                       "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
+                       final_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0 and os.path.exists(final_path):
                 # Clean up intermediate files to save disk on long videos
                 for p in [mixed_path, bg_path]:
@@ -2755,7 +2839,7 @@ def dub_video(
                 if not os.path.exists(ts["audio_path"]) or os.path.getsize(ts["audio_path"]) == 0:
                     # Generate silence for missing clips
                     silence_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                                   "anullsrc=r=24000:cl=mono", "-t", "0.3",
+                                   "anullsrc=r=48000:cl=mono", "-t", "0.3",
                                    "-c:a", "libmp3lame", ts["audio_path"]]
                     subprocess.run(silence_cmd, capture_output=True)
                     missing += 1
