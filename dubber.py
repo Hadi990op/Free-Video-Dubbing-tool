@@ -492,6 +492,7 @@ def diarize_audio(audio_path: str, num_speakers: int = None,
             for n in range(2, max_try + 1):
                 result_n = diar.diarize(audio_path, num_speakers=n, extra_info=True)
                 labels = result_n['cluster_labels']
+                score = -1  # default if only 1 cluster
                 if len(set(labels)) > 1:
                     score = silhouette_score(embeds, labels)
                     if progress_callback:
@@ -901,9 +902,14 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
 
         except Exception as e:
             print(f"        LLM batch {batch_start}-{batch_end} failed: {e}")
-            # Fall back to Google Translate for this batch
-            return None  # signal failure
+            # Don't return None — partial results are still useful.
+            # The caller will check which segments are still None and
+            # fall back to Google Translate for those.
+            continue
 
+    # If nothing was translated, signal failure
+    if all(t is None for t in translations):
+        return None
     return translations
 
 
@@ -1001,19 +1007,22 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             print(f"        LLM translation error: {e}")
 
         if llm_result:
-            # Fill in LLM translations
+            # Fill in LLM translations (only non-None entries)
             for i, trans in enumerate(llm_result):
                 if trans:
-                    orig_idx = pending_indices[i]
-                    translated[orig_idx] = {
-                        **segments[orig_idx],
-                        "translated": trans,
-                    }
+                    if i < len(pending_indices):
+                        orig_idx = pending_indices[i]
+                        if orig_idx < len(segments):
+                            translated[orig_idx] = {
+                                **segments[orig_idx],
+                                "translated": trans,
+                            }
             done_count = sum(1 for t in translated if t)
             print(f"        LLM translated {done_count}/{len(segments)} segments")
-            if progress_callback:
-                progress_callback(done_count, len(segments),
-                                 translated[pending_indices[0]]["translated"][:60] if translated[pending_indices[0]] else "")
+            if progress_callback and pending_indices:
+                first_idx = pending_indices[0]
+                preview = translated[first_idx]["translated"][:60] if first_idx < len(translated) and translated[first_idx] else ""
+                progress_callback(done_count, len(segments), preview)
 
             # Save checkpoint
             if trans_ckpt_path:
@@ -3065,6 +3074,11 @@ def dub_video(
             # Otherwise: no background
             if keep_background_music and no_vocals_path:
                 bg_audio_path = no_vocals_path
+                use_bg = True
+            elif keep_background_music and not no_vocals_path:
+                # Demucs failed — fall back to full original audio at low volume
+                log(5, f"        ⚠ Vocal isolation failed, using full original audio as background")
+                bg_audio_path = audio_wav
                 use_bg = True
             elif keep_background:
                 bg_audio_path = audio_wav

@@ -1111,8 +1111,8 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             voice=voice,
             model_size=model_size,
             output_path=output_path,
-            keep_background=keep_bg,
-            keep_background_music=keep_bg,
+            keep_background=False,  # legacy: full audio at low volume (not used)
+            keep_background_music=keep_bg,  # new: Demucs vocal isolation + sidechain
             burn_subtitles=burn_subtitles,
             generate_srt_file=gen_srt,
             progress_callback=progress_callback,
