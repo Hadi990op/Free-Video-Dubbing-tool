@@ -780,6 +780,133 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
 # Languages that should be romanized (written in Latin script like daily conversation)
 ROMAN_LANGS = {"hi", "ur"}
 
+# Language full names for LLM prompts
+LANG_FULL_NAMES = {
+    "hi": "Hindi (Roman script / Hinglish — written in Latin letters like 'aap kaise hain?')",
+    "ur": "Urdu (Roman script / Roman Urdu — written in Latin letters like 'aap kaise hain?')",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "ru": "Russian", "ja": "Japanese", "ko": "Korean",
+    "zh": "Chinese (Simplified)", "ar": "Arabic", "tr": "Turkish",
+    "nl": "Dutch", "pl": "Polish", "id": "Indonesian", "vi": "Vietnamese",
+    "th": "Thai", "bn": "Bengali", "ta": "Tamil", "te": "Telugu",
+    "mr": "Marathi", "gu": "Gujarati", "pa": "Punjabi", "ml": "Malayalam",
+    "kn": "Kannada", "or": "Odia", "sv": "Swedish", "no": "Norwegian",
+    "da": "Danish", "fi": "Finnish", "cs": "Czech", "el": "Greek",
+    "ro": "Romanian", "hu": "Hungarian", "uk": "Ukrainian", "he": "Hebrew",
+    "fa": "Persian", "ms": "Malay", "tl": "Filipino", "sw": "Swahili",
+    "en": "English",
+}
+
+
+def llm_translate_batch(segments: list, target_lang: str, source_lang: str = None,
+                        batch_size: int = 15) -> list:
+    """Translate segments using LLM (Pollinations AI, free, no API key).
+    Sends segments in batches with surrounding context for better translation.
+    Returns list of translated strings (same order as input).
+
+    Advantages over Google Translate:
+    - Context-aware: uses surrounding sentences for correct pronouns/tense
+    - Idiom-aware: translates idioms naturally, not literally
+    - Conversational: natural daily-life style, not formal textbook
+    - Consistent: same terminology across the whole video
+    """
+    import requests
+
+    lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
+    use_roman = target_lang in ROMAN_LANGS
+
+    # Build system prompt
+    if use_roman:
+        system = (
+            f"You are a professional dubbing translator. Translate the dialogue to {lang_name}. "
+            "Keep it natural and conversational — like how people actually talk in daily life. "
+            "Preserve the tone and emotion of the original. "
+            "Keep proper nouns (names, places, brands) as-is. "
+            "Only output the translations, one per line, prefixed with the segment number. "
+            "Format: '1. <translation>'"
+        )
+    else:
+        system = (
+            f"You are a professional dubbing translator. Translate the dialogue to {lang_name}. "
+            "Keep it natural and conversational. Preserve the tone and emotion. "
+            "Keep proper nouns (names, places, brands) as-is. "
+            "Only output the translations, one per line, prefixed with the segment number. "
+            "Format: '1. <translation>'"
+        )
+
+    translations = [None] * len(segments)
+
+    # Process in batches with context overlap
+    for batch_start in range(0, len(segments), batch_size):
+        batch_end = min(batch_start + batch_size, len(segments))
+        batch = segments[batch_start:batch_end]
+
+        # Include 2 sentences before and after as context (not translated)
+        ctx_before = segments[max(0, batch_start - 2):batch_start]
+        ctx_after = segments[batch_end:min(len(segments), batch_end + 2)]
+
+        # Build user message
+        lines = []
+        if ctx_before:
+            lines.append("[Context before]")
+            for i, seg in enumerate(ctx_before):
+                lines.append(f"C{i}: {seg['text']}")
+            lines.append("")
+
+        lines.append("[Translate these]")
+        for i, seg in enumerate(batch):
+            seg_num = i + 1
+            lines.append(f"{seg_num}. {seg['text']}")
+
+        if ctx_after:
+            lines.append("")
+            lines.append("[Context after — do not translate]")
+            for i, seg in enumerate(ctx_after):
+                lines.append(f"C{i}: {seg['text']}")
+
+        user_msg = "\n".join(lines)
+
+        payload = {
+            "model": "openai",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1000
+        }
+
+        try:
+            r = requests.post("https://text.pollinations.ai/openai",
+                            json=payload, timeout=60)
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
+
+            data = r.json()
+            response_text = data["choices"][0]["message"]["content"]
+
+            # Parse numbered translations
+            import re
+            for line in response_text.strip().split("\n"):
+                match = re.match(r'^(\d+)\.\s*(.+)', line)
+                if match:
+                    seg_num = int(match.group(1))
+                    translation = match.group(2).strip()
+                    if 1 <= seg_num <= len(batch):
+                        translations[batch_start + seg_num - 1] = translation
+
+            # Rate limit: anonymous tier is 1 req / 15s, but we try faster
+            # and retry on failure
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"        LLM batch {batch_start}-{batch_end} failed: {e}")
+            # Fall back to Google Translate for this batch
+            return None  # signal failure
+
+    return translations
+
+
 def google_translate_romanized(text: str, target_lang: str, source_lang: str = "auto"):
     """Translate text and return BOTH native script AND romanized version.
     Uses Google's unofficial API which includes romanization (dt=rm).
@@ -824,7 +951,11 @@ def google_translate_romanized(text: str, target_lang: str, source_lang: str = "
 
 def translate_segments(segments: list, target_lang: str, source_lang: str = None,
                       job_dir: str = None, progress_callback=None) -> list:
-    """Translate each segment's text to target language using Google Translate.
+    """Translate each segment's text to target language.
+    
+    Primary: LLM (Pollinations AI) — context-aware, natural, idiomatic.
+    Fallback: Google Translate — reliable but literal.
+    
     For hi/ur: produces Roman Hindi/Urdu (Hinglish/Roman Urdu) — natural daily-life
     style like 'aap kya kar rahe ho?' instead of formal Devanagari/Arabic script.
     This romanized text is what edge-tts speaks AND what subtitles show.
@@ -857,74 +988,107 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             except Exception:
                 pass
 
-    # For non-roman languages, use deep_translator (simpler, more reliable)
-    if not use_roman:
-        from deep_translator import GoogleTranslator
-        def make_translator():
-            return GoogleTranslator(source="auto", target=target_lang)
-        translator = make_translator()
+    # --- Try LLM translation first (context-aware, natural) ---
+    pending_indices = [i for i, t in enumerate(translated) if t is None]
+    if pending_indices:
+        pending_segments = [segments[i] for i in pending_indices]
+        print(f"        Translating {len(pending_segments)} segments with LLM (context-aware)...")
+        llm_result = None
+        try:
+            llm_result = llm_translate_batch(pending_segments, target_lang,
+                                           source_lang, batch_size=15)
+        except Exception as e:
+            print(f"        LLM translation error: {e}")
 
-    for i, seg in enumerate(segments):
-        # Skip if already translated from checkpoint
-        if translated[i] is not None:
-            continue
+        if llm_result:
+            # Fill in LLM translations
+            for i, trans in enumerate(llm_result):
+                if trans:
+                    orig_idx = pending_indices[i]
+                    translated[orig_idx] = {
+                        **segments[orig_idx],
+                        "translated": trans,
+                    }
+            done_count = sum(1 for t in translated if t)
+            print(f"        LLM translated {done_count}/{len(segments)} segments")
+            if progress_callback:
+                progress_callback(done_count, len(segments),
+                                 translated[pending_indices[0]]["translated"][:60] if translated[pending_indices[0]] else "")
 
-        max_retries = 5
-        translated_text = None
-
-        if use_roman:
-            # Romanized translation via Google's unofficial API
-            for attempt in range(max_retries):
-                try:
-                    native_text, roman_text = google_translate_romanized(
-                        seg["text"], target_lang, source_lang or "auto"
-                    )
-                    # Prefer roman text (natural daily style); fallback to native
-                    translated_text = roman_text if roman_text else native_text
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
-                        time.sleep(wait_time)
-                    else:
-                        print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
-                        translated_text = seg["text"]  # fallback to original
+            # Save checkpoint
+            if trans_ckpt_path:
+                done = {str(j): translated[j]["translated"]
+                        for j in range(len(translated)) if translated[j]}
+                with open(trans_ckpt_path, "w") as f:
+                    json.dump({"translated": done}, f, ensure_ascii=False)
         else:
-            # Non-roman: use deep_translator
-            for attempt in range(max_retries):
-                try:
-                    translated_text = translator.translate(seg["text"])
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
-                        time.sleep(wait_time)
-                        translator = make_translator()
-                    else:
-                        print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
-                        translated_text = seg["text"]
+            print(f"        LLM translation failed, falling back to Google Translate...")
 
-        new_seg = dict(seg)
-        new_seg["translated"] = translated_text
-        translated[i] = new_seg
+    # --- Fallback: Google Translate for any remaining untranslated ---
+    remaining = [i for i, t in enumerate(translated) if t is None]
+    if remaining:
+        if use_roman:
+            print(f"        Translating {len(remaining)} segments with Google (Roman)...")
+        else:
+            print(f"        Translating {len(remaining)} segments with Google Translate...")
+        
+        if not use_roman:
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source="auto", target=target_lang)
 
-        # Save checkpoint every 5 segments
-        if trans_ckpt_path and ((i + 1) % 5 == 0 or i == len(segments) - 1):
-            done = {str(j): translated[j]["translated"] for j in range(i + 1) if translated[j]}
-            with open(trans_ckpt_path, "w") as f:
-                json.dump({"translated": done}, f, ensure_ascii=False)
+        for i in remaining:
+            seg = segments[i]
+            max_retries = 5
+            translated_text = None
 
-        # Rate limit protection
-        if (i + 1) % 50 == 0 and i < len(segments) - 1:
-            time.sleep(1)
+            if use_roman:
+                # Romanized translation via Google's unofficial API
+                for attempt in range(max_retries):
+                    try:
+                        native_text, roman_text = google_translate_romanized(
+                            seg["text"], target_lang, source_lang or "auto"
+                        )
+                        # Prefer roman text (natural daily style); fallback to native
+                        translated_text = roman_text if roman_text else native_text
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 5
+                            print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
+                            translated_text = seg["text"]  # fallback to original
+            else:
+                # Non-roman: use deep_translator
+                for attempt in range(max_retries):
+                    try:
+                        translated_text = translator.translate(seg["text"])
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 5
+                            print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
+                            time.sleep(wait_time)
+                            translator = GoogleTranslator(source="auto", target=target_lang)
+                        else:
+                            print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
+                            translated_text = seg["text"]
 
-        # progress indicator
-        if (i + 1) % 10 == 0 or i == len(segments) - 1:
-            print(f"        Translated {i + 1}/{len(segments)} segments")
-        if progress_callback:
-            progress_callback(i + 1, len(segments), translated[i]["translated"][:60] if translated[i] else "")
+            translated[i] = {**seg, "translated": translated_text}
+
+            # Save checkpoint every 5 segments
+            if trans_ckpt_path and ((len(remaining) - remaining.index(i)) % 5 == 0 or i == remaining[-1]):
+                done = {str(j): translated[j]["translated"] for j in range(len(translated)) if translated[j]}
+                with open(trans_ckpt_path, "w") as f:
+                    json.dump({"translated": done}, f, ensure_ascii=False)
+
+            # progress indicator
+            done_now = sum(1 for t in translated if t)
+            if done_now % 10 == 0 or i == remaining[-1]:
+                print(f"        Translated {done_now}/{len(segments)} segments")
+            if progress_callback:
+                progress_callback(done_now, len(segments), translated[i]["translated"][:60] if translated[i] else "")
 
     # Clean up translation checkpoint after success
     if trans_ckpt_path and os.path.exists(trans_ckpt_path):
