@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Auto-cleanup for old video-dubber jobs.
 Removes output and upload directories older than max_age_hours.
-Also cleans up any stale temp files.
+Also cleans up temp files and clears caches.
 """
 import os
 import time
 import shutil
+import gc
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 UPLOADS_DIR = BASE_DIR / "uploads"
-MAX_AGE_HOURS = 24
+MAX_AGE_HOURS = 6  # Reduced from 24h to 6h to save disk
 
 def cleanup_dir(dir_path: Path, max_age_hours: float):
     """Remove subdirectories older than max_age_hours."""
@@ -33,11 +34,43 @@ def cleanup_dir(dir_path: Path, max_age_hours: float):
             print(f"  Error checking {item}: {e}")
     return removed
 
+def cleanup_tmp():
+    """Clean up all temp files from /tmp."""
+    now = time.time()
+    removed = 0
+    for pattern in ["dubber_*", "video_extend_*", "demucs_*"]:
+        for f in Path("/tmp").glob(pattern):
+            try:
+                age = now - f.stat().st_mtime
+                # Remove if older than 1 hour
+                if age > 3600:
+                    if f.is_dir():
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        f.unlink()
+                    removed += 1
+            except Exception:
+                pass
+    return removed
+
 def main():
     print(f"Cleanup: removing dirs older than {MAX_AGE_HOURS}h")
     out_removed = cleanup_dir(OUTPUTS_DIR, MAX_AGE_HOURS)
     up_removed = cleanup_dir(UPLOADS_DIR, MAX_AGE_HOURS)
-    print(f"Done: removed {out_removed} output dirs, {up_removed} upload dirs")
+    tmp_removed = cleanup_tmp()
+
+    # Force garbage collection
+    gc.collect()
+
+    # Clear torch cache
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    print(f"Done: removed {out_removed} output dirs, {up_removed} upload dirs, {tmp_removed} temp dirs")
 
 if __name__ == "__main__":
     main()

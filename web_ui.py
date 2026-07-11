@@ -31,6 +31,149 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Track job status
 jobs = {}
+# Cancel flags — set to True to stop a running job
+cancel_flags = {}
+
+# Maximum number of old jobs to keep (older ones auto-deleted on startup)
+MAX_OLD_JOBS = 5
+
+
+def cleanup_old_jobs():
+    """Delete old job directories to free disk space.
+    Keeps MAX_OLD_JOBS most recent. Called on startup."""
+    import time as _time
+    import shutil as _shutil
+    now = _time.time()
+
+    for base_dir in [UPLOAD_DIR, OUTPUT_DIR]:
+        try:
+            dirs = []
+            for d in base_dir.iterdir():
+                if d.is_dir():
+                    try:
+                        mtime = d.stat().st_mtime
+                    except OSError:
+                        continue
+                    dirs.append((d, mtime))
+            dirs.sort(key=lambda x: x[1], reverse=True)
+            for d, mtime in dirs[MAX_OLD_JOBS:]:
+                if now - mtime > 3600:  # Only delete if older than 1 hour
+                    try:
+                        _shutil.rmtree(d, ignore_errors=True)
+                        print(f"[cleanup] Removed old dir: {d.name}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Clean leftover temp files in /tmp
+    try:
+        for pattern in ["dubber_*", "video_extend_*"]:
+            for f in Path("/tmp").glob(pattern):
+                if now - f.stat().st_mtime > 86400:
+                    try:
+                        if f.is_dir():
+                            _shutil.rmtree(f, ignore_errors=True)
+                        else:
+                            f.unlink()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Clean orphaned checkpoint dirs (no video file = orphaned)
+    try:
+        for d in UPLOAD_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            has_video = any(f.suffix in ('.mp4', '.mkv', '.avi', '.mov', '.webm')
+                           for f in d.iterdir() if f.is_file())
+            has_output = (OUTPUT_DIR / d.name).exists()
+            if not has_video and not has_output and now - d.stat().st_mtime > 3600:
+                _shutil.rmtree(d, ignore_errors=True)
+                print(f"[cleanup] Removed orphaned: {d.name}")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Job status persistence — survives server restart / OOM kill
+# ---------------------------------------------------------------------------
+
+def save_job_status(job_id, status_data):
+    """Save job status to disk so it survives server restart."""
+    try:
+        status_path = UPLOAD_DIR / job_id / "job_status.json"
+        # Don't save logs (too large) — they're reconstructed from checkpoint
+        slim = {k: v for k, v in status_data.items() if k != "logs"}
+        slim["saved_at"] = time.time()
+        with open(status_path, "w") as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_job_status(job_id):
+    """Load job status from disk. Returns None if not found."""
+    try:
+        status_path = UPLOAD_DIR / job_id / "job_status.json"
+        if status_path.exists():
+            with open(status_path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+def auto_resume_jobs():
+    """On startup: find jobs with checkpoints but no completed output,
+    and mark them as paused so the user can resume."""
+    import dubber
+    for d in UPLOAD_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        job_id = d.name
+        # Skip if output already exists (job completed)
+        if (OUTPUT_DIR / job_id / "dubbed.mp4").exists():
+            continue
+        # Check for checkpoint
+        ckpt = dubber.load_checkpoint(str(d))
+        if not ckpt:
+            continue
+        # Check for video file
+        has_video = any(f.suffix in ('.mp4', '.mkv', '.avi', '.mov', '.webm')
+                       for f in d.iterdir() if f.is_file())
+        if not has_video:
+            continue
+        # Try to load saved status
+        saved = load_job_status(job_id)
+        stage = ckpt.get("stage", 0)
+        jobs[job_id] = {
+            "status": "paused",
+            "stage": stage,
+            "progress": saved.get("progress", {1: 5, 2: 30, 3: 55, 4: 75, 5: 90}.get(stage, 0)) if saved else {1: 5, 2: 30, 3: 55, 4: 75, 5: 90}.get(stage, 0),
+            "message": f"Server restarted. Interrupted at stage {stage}. Click Resume to continue.",
+            "can_resume": True,
+            "target_lang": ckpt.get("target_lang", saved.get("target_lang", "hi") if saved else "hi"),
+            "voice": ckpt.get("voice") or (saved.get("voice") if saved else None),
+            "model_size": ckpt.get("model_size", saved.get("model_size", "base") if saved else "base"),
+            "keep_bg": saved.get("keep_bg", False) if saved else False,
+            "burn_subtitles": saved.get("burn_subtitles", False) if saved else False,
+            "gen_srt": saved.get("gen_srt", True) if saved else True,
+            "multi_speaker": ckpt.get("multi_speaker", False),
+            "num_speakers": ckpt.get("num_speakers"),
+            "voice_clone": saved.get("voice_clone", False) if saved else False,
+            "extend_video": saved.get("extend_video", True) if saved else True,
+            "output_video": None,
+            "srt_file": None,
+            "segments_count": 0,
+            "elapsed_seconds": 0,
+            "logs": [],
+        }
+        print(f"[startup] Found interrupted job {job_id} at stage {stage} — marked as paused (resumable)")
+
+
+# Run cleanup on import (service startup)
+cleanup_old_jobs()
+auto_resume_jobs()
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +369,24 @@ HTML_TEMPLATE = r"""
             border-radius: 5px;
             transition: width 0.5s ease;
             width: 0%;
+        }
+        .progress-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .progress-row .progress-bar-bg {
+            flex: 1;
+            margin-bottom: 0;
+        }
+        .progress-pct {
+            font-size: 1.1em;
+            font-weight: 700;
+            color: var(--accent);
+            min-width: 48px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
         }
         .progress-text {
             font-size: 0.9em;
@@ -499,8 +660,11 @@ HTML_TEMPLATE = r"""
 
         <!-- Progress -->
         <div class="progress-container" id="progressContainer">
-            <div class="progress-bar-bg">
-                <div class="progress-bar-fill" id="progressBar"></div>
+            <div class="progress-row">
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="progressBar"></div>
+                </div>
+                <div class="progress-pct" id="progressPct">0%</div>
             </div>
             <div class="progress-text" id="progressText">Initializing...</div>
             <div class="progress-subtext" id="progressSubtext"></div>
@@ -516,6 +680,7 @@ HTML_TEMPLATE = r"""
                 <span class="step" id="step5">5. Mux Video</span>
             </div>
             <div class="console-log" id="consoleLog"></div>
+            <button class="btn" id="cancelBtn" style="display: none; margin-top: 15px; background: #e74c3c; color: white; font-size: 14px; padding: 10px 24px;">✖ Cancel Job</button>
         </div>
 
         <!-- Result -->
@@ -529,6 +694,7 @@ HTML_TEMPLATE = r"""
                 </div>
                 <a class="btn btn-download" id="downloadVideo" href="#">📥 Download Dubbed Video</a>
                 <a class="btn btn-download" id="downloadSrt" href="#" style="background: var(--accent); display: none;">📝 Download Subtitles (.srt)</a>
+                <button class="btn" id="cleanupBtn" style="display: block; margin-top: 15px; background: #2c3e50; color: white; font-size: 14px; padding: 10px 24px; width: 100%;">🗑️ Clean Up &amp; Start New (Free Memory)</button>
             </div>
         </div>
 
@@ -554,9 +720,70 @@ let maxProgress = 0;        // monotonic progress — never goes backwards
 let lastLogMsg = '';       // dedupe console log
 let lastLogTime = 0;
 
+// Job persistence — survives browser/tab close
+const JOB_STORAGE_KEY = 'dubber_job_id';
+
+function saveJobId(id) {
+    try { localStorage.setItem(JOB_STORAGE_KEY, id); } catch(e) {}
+}
+function clearJobId() {
+    try { localStorage.removeItem(JOB_STORAGE_KEY); } catch(e) {}
+}
+function getSavedJobId() {
+    try { return localStorage.getItem(JOB_STORAGE_KEY); } catch(e) { return null; }
+}
+
 // Compute base path so API calls work regardless of mount point
 // e.g. if served at /dubber/, base = '/dubber/'
 const BASE = window.location.pathname.replace(/\/[^/]*$/, '/');
+
+// On page load: check if there's an active job from a previous session
+(function checkSavedJob() {
+    const savedId = getSavedJobId();
+    if (!savedId) return;
+    fetch(BASE + 'api/status/' + savedId)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                // Job gone (cleanup ran or server restarted) — clear stale ID
+                clearJobId();
+                return;
+            }
+            if (data.status === 'done') {
+                // Job finished while we were away — show result
+                jobId = savedId;
+                document.getElementById('progressContainer').classList.add('active');
+                document.getElementById('progressBar').style.width = '100%';
+                document.getElementById('progressPct').textContent = '100%';
+                document.getElementById('progressText').textContent = 'Completed (reconnected)';
+                showResult(data);
+                clearJobId();
+            } else if (data.status === 'error') {
+                clearJobId();
+            } else if (data.status === 'paused') {
+                // Job was interrupted (server restart/OOM) — show Resume button
+                jobId = savedId;
+                maxProgress = data.progress || 0;
+                document.getElementById('progressContainer').classList.add('active');
+                document.getElementById('progressBar').style.width = maxProgress + '%';
+                document.getElementById('progressPct').textContent = Math.round(maxProgress) + '%';
+                document.getElementById('progressText').textContent = data.message || 'Interrupted. Click Resume to continue.';
+                document.getElementById('processingIndicator').classList.remove('active');
+                if (data.can_resume) document.getElementById('resumeBtn').style.display = 'block';
+            } else {
+                // Job still running — reconnect to it
+                jobId = savedId;
+                maxProgress = data.progress || 0;
+                document.getElementById('progressContainer').classList.add('active');
+                document.getElementById('dubBtn').disabled = true;
+                document.getElementById('progressBar').style.width = maxProgress + '%';
+                document.getElementById('progressPct').textContent = Math.round(maxProgress) + '%';
+                document.getElementById('progressText').textContent = data.message || 'Reconnected to running job...';
+                pollStatus();
+            }
+        })
+        .catch(() => clearJobId());
+})();
 
 // Voice options per language
 const VOICES = {
@@ -674,6 +901,7 @@ async function startDubbing() {
     document.getElementById('resultContainer').classList.remove('active');
     document.getElementById('errorContainer').classList.remove('active');
     document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressPct').textContent = '0%';
     document.getElementById('progressText').textContent = 'Uploading video...';
     maxProgress = 0;
 
@@ -695,6 +923,7 @@ async function startDubbing() {
             if (e.lengthComputable) {
                 const pct = Math.round((e.loaded / e.total) * 100);
                 document.getElementById('progressBar').style.width = pct + '%';
+                document.getElementById('progressPct').textContent = pct + '%';
                 document.getElementById('progressText').textContent = 'Uploading video... ' + pct + '%';
             }
         };
@@ -727,6 +956,7 @@ async function startDubbing() {
                         throw new Error(data.error);
                     }
                     jobId = data.job_id;
+                    saveJobId(jobId);
                     document.getElementById('progressText').textContent = 'Processing...';
                     pollStatus();
                 } catch (e) {
@@ -765,6 +995,7 @@ function pollStatus() {
                 const pct = data.progress || 0;
                 if (pct > maxProgress) maxProgress = pct;
                 document.getElementById('progressBar').style.width = maxProgress + '%';
+                document.getElementById('progressPct').textContent = Math.round(maxProgress) + '%';
                 document.getElementById('progressText').textContent = data.message || 'Processing...';
 
                 // Sub-progress (e.g. "45/425 segments translated")
@@ -778,8 +1009,9 @@ function pollStatus() {
                     subEl.textContent = '';
                 }
 
-                // Show processing indicator
+                // Show processing indicator + cancel button
                 document.getElementById('processingIndicator').classList.add('active');
+                document.getElementById('cancelBtn').style.display = 'block';
 
                 // Update steps
                 for (let i = 1; i <= 5; i++) {
@@ -804,21 +1036,36 @@ function pollStatus() {
 
                 if (data.status === 'done') {
                     clearInterval(pollInterval);
+                    maxProgress = 100;
+                    document.getElementById('progressBar').style.width = '100%';
+                    document.getElementById('progressPct').textContent = '100%';
                     addConsoleLog('✅ Dubbing complete!', 'done', -1);
                     document.getElementById('processingIndicator').classList.remove('active');
+                    document.getElementById('cancelBtn').style.display = 'none';
+                    clearJobId();
                     showResult(data);
                 } else if (data.status === 'paused') {
                     clearInterval(pollInterval);
                     addConsoleLog('⏸ Paused: ' + data.message, 'err', -1);
                     document.getElementById('processingIndicator').classList.remove('active');
+                    document.getElementById('cancelBtn').style.display = 'none';
                     showError(data.message);
                     if (data.can_resume) document.getElementById('resumeBtn').style.display = 'block';
                 } else if (data.status === 'error') {
                     clearInterval(pollInterval);
                     addConsoleLog('❌ Error: ' + data.message, 'err', -1);
                     document.getElementById('processingIndicator').classList.remove('active');
+                    document.getElementById('cancelBtn').style.display = 'none';
+                    clearJobId();
                     showError(data.message);
                     if (data.can_resume) document.getElementById('resumeBtn').style.display = 'block';
+                } else if (data.status === 'cancelled') {
+                    clearInterval(pollInterval);
+                    addConsoleLog('✖ Job cancelled', 'err', -1);
+                    document.getElementById('processingIndicator').classList.remove('active');
+                    document.getElementById('cancelBtn').style.display = 'none';
+                    clearJobId();
+                    showError('Job cancelled. All files cleaned up.');
                 }
             })
             .catch(e => {
@@ -946,6 +1193,7 @@ async function resumeJob() {
     document.getElementById('progressText').textContent = 'Resuming from checkpoint...';
     document.getElementById('dubBtn').disabled = true;
     document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressPct').textContent = '0%';
     maxProgress = 0;
     document.getElementById('consoleLog').innerHTML = '';
 
@@ -962,6 +1210,105 @@ async function resumeJob() {
 
 // Wire up resume button
 document.getElementById('resumeBtn').addEventListener('click', resumeJob);
+
+// Cancel button — stops running job and cleans up
+document.getElementById('cancelBtn').addEventListener('click', async function() {
+    if (!jobId) return;
+    if (!confirm('Cancel this job? All progress will be lost and files cleaned up.')) return;
+
+    const btn = document.getElementById('cancelBtn');
+    btn.textContent = '⏳ Cancelling...';
+    btn.disabled = true;
+
+    try {
+        await fetch(BASE + 'api/cancel/' + jobId, { method: 'POST' });
+        // Wait a moment for the server to process the cancel
+        setTimeout(async () => {
+            // Full cleanup
+            await fetch(BASE + 'api/cleanup/' + jobId, { method: 'POST' });
+            // Reset UI to fresh state
+            resetUI();
+        }, 2000);
+    } catch (e) {
+        // Even if cancel fails, do cleanup
+        try { await fetch(BASE + 'api/cleanup/' + jobId, { method: 'POST' }); } catch(e2) {}
+        resetUI();
+    }
+});
+
+// Cleanup button — after download, purges everything and resets
+document.getElementById('cleanupBtn').addEventListener('click', async function() {
+    if (!jobId) {
+        // No job to clean — just reset UI
+        resetUI();
+        return;
+    }
+
+    const btn = document.getElementById('cleanupBtn');
+    btn.textContent = '⏳ Cleaning up...';
+    btn.disabled = true;
+
+    try {
+        await fetch(BASE + 'api/cleanup/' + jobId, { method: 'POST' });
+    } catch (e) {
+        // Ignore errors — cleanup is best-effort
+    }
+
+    resetUI();
+});
+
+function resetUI() {
+    // Clear job tracking
+    jobId = null;
+    maxProgress = 0;
+    clearJobId();
+
+    // Hide all status containers
+    document.getElementById('progressContainer').classList.remove('active');
+    document.getElementById('resultContainer').classList.remove('active');
+    document.getElementById('errorContainer').classList.remove('active');
+
+    // Reset progress bar
+    document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressPct').textContent = '0%';
+    document.getElementById('progressText').textContent = '';
+    document.getElementById('progressSubtext').textContent = '';
+    document.getElementById('progressSubtext').style.display = 'none';
+    document.getElementById('consoleLog').innerHTML = '';
+
+    // Reset steps
+    for (let i = 1; i <= 5; i++) {
+        document.getElementById('step' + i).className = 'step';
+    }
+
+    // Hide cancel button
+    document.getElementById('cancelBtn').style.display = 'none';
+    document.getElementById('cancelBtn').textContent = '✖ Cancel Job';
+    document.getElementById('cancelBtn').disabled = false;
+
+    // Reset cleanup button
+    document.getElementById('cleanupBtn').textContent = '🗑️ Clean Up & Start New (Free Memory)';
+    document.getElementById('cleanupBtn').disabled = false;
+
+    // Hide preview
+    document.getElementById('previewWrap').style.display = 'none';
+    document.getElementById('dubbedPreview').src = '';
+
+    // Hide SRT button
+    document.getElementById('downloadSrt').style.display = 'none';
+
+    // Re-enable dub button
+    document.getElementById('dubBtn').disabled = false;
+
+    // Hide resume button
+    document.getElementById('resumeBtn').style.display = 'none';
+
+    // Hide processing indicator
+    document.getElementById('processingIndicator').classList.remove('active');
+
+    // Scroll to top
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
 </script>
 </body>
 </html>
@@ -1064,13 +1411,39 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
     """Background job processor."""
     import dubber
 
+    # Register cancel flag
+    cancel_flags[job_id] = False
+
     output_path = str(OUTPUT_DIR / job_id / "dubbed.mp4")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # Job directory for checkpoints — use the upload dir which has the video
     job_dir = str(UPLOAD_DIR / job_id)
 
+    # Save job parameters to checkpoint so auto_resume can restore them after OOM/restart
+    try:
+        dubber.save_checkpoint(job_dir, 0, {
+            "target_lang": target_lang,
+            "voice": voice,
+            "model_size": model_size,
+            "keep_bg": keep_bg,
+            "burn_subtitles": burn_subtitles,
+            "gen_srt": gen_srt,
+            "multi_speaker": multi_speaker,
+            "num_speakers": num_speakers,
+            "voice_clone": voice_clone,
+            "extend_video": extend_video,
+        })
+    except Exception:
+        pass
+    # Also save to job_status.json for the status endpoint
+    save_job_status(job_id, jobs.get(job_id, {}))
+
     def progress_callback(stage, message, sub_progress=None, sub_total=None):
+        # Check cancel flag
+        if cancel_flags.get(job_id, False):
+            raise InterruptedError("Job cancelled by user")
+
         # Stage ranges (start%, end%) for overall progress
         stage_ranges = {1: (0, 5), 2: (5, 30), 3: (30, 55), 4: (55, 75), 5: (75, 90), 6: (90, 95)}
         stage_done = {1: 5, 2: 30, 3: 55, 4: 75, 5: 90, 6: 95, "done": 100}
@@ -1102,6 +1475,12 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             "sub_progress": sub_progress,
             "sub_total": sub_total,
         })
+        # Persist to disk (throttled — at most once per 5 seconds)
+        if not hasattr(progress_callback, "_last_save"):
+            progress_callback._last_save = 0
+        if time.time() - progress_callback._last_save > 5:
+            progress_callback._last_save = time.time()
+            save_job_status(job_id, jobs[job_id])
 
         # Append to log history (keep last 200)
         if "logs" not in jobs[job_id]:
@@ -1146,6 +1525,19 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             "speakers": result.get("speakers", {}),
             "num_speakers": result.get("num_speakers", 0),
         })
+        save_job_status(job_id, jobs[job_id])
+    except InterruptedError as e:
+        # Job cancelled by user
+        if "logs" not in jobs[job_id]:
+            jobs[job_id]["logs"] = []
+        jobs[job_id]["logs"].append({"stage": "err", "message": "Cancelled by user", "time": time.time()})
+        jobs[job_id].update({
+            "status": "cancelled",
+            "message": "Job cancelled by user.",
+            "can_resume": False,
+        })
+        save_job_status(job_id, jobs[job_id])
+        print(f"[job {job_id}] Cancelled by user")
     except Exception as e:
         # Log error to console
         err_msg = f"Error: {e}"
@@ -1167,6 +1559,47 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
                 "status": "error",
                 "message": str(e),
             })
+        save_job_status(job_id, jobs[job_id])
+    finally:
+        # === Automatic cache cleanup after every job (done or error) ===
+        import gc
+        import shutil as _shutil
+        from pathlib import Path
+
+        # 1. Clear Python garbage + model caches
+        gc.collect()
+
+        # 2. Delete temp working dirs for this job
+        try:
+            for tmp_dir in Path("/tmp").glob("dubber_*"):
+                try:
+                    _shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3. Clear torch cache if loaded
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+        except Exception:
+            pass
+
+        # 4. Free ModelManager memory
+        try:
+            from model_manager import ModelManager
+            mm = ModelManager()
+            mm.unload_current()
+        except Exception:
+            pass
+
+        # 5. Clear cancel flag
+        cancel_flags.pop(job_id, None)
+
+        print(f"[job {job_id}] Cache cleanup done")
 
 
 @app.route("/api/status/<job_id>")
@@ -1266,6 +1699,84 @@ def api_resume(job_id):
     thread.start()
 
     return jsonify({"job_id": job_id, "status": "resuming"})
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def api_cancel(job_id):
+    """Cancel a running job."""
+    if job_id not in jobs:
+        return jsonify({"error": "Job not found"}), 404
+
+    # Set cancel flag — the processing thread checks this in progress_callback
+    cancel_flags[job_id] = True
+
+    # Update status immediately
+    jobs[job_id].update({
+        "status": "cancelled",
+        "message": "Cancelling...",
+    })
+    save_job_status(job_id, jobs[job_id])
+
+    return jsonify({"job_id": job_id, "status": "cancelling"})
+
+
+@app.route("/api/cleanup/<job_id>", methods=["POST"])
+def api_cleanup(job_id):
+    """Full cleanup after user is done with the result.
+    Removes: upload dir, output dir, checkpoints, temp files, model caches.
+    Frees all memory and storage for this job."""
+    import gc
+    import shutil as _shutil
+
+    # Cancel if still running
+    cancel_flags[job_id] = True
+
+    # Remove from memory
+    jobs.pop(job_id, None)
+    cancel_flags.pop(job_id, None)
+
+    # Delete upload directory (original video + checkpoints + status)
+    upload_path = UPLOAD_DIR / job_id
+    if upload_path.exists():
+        _shutil.rmtree(upload_path, ignore_errors=True)
+
+    # Delete output directory (dubbed video + srt)
+    output_path = OUTPUT_DIR / job_id
+    if output_path.exists():
+        _shutil.rmtree(output_path, ignore_errors=True)
+
+    # Delete temp working dirs
+    for pattern in ["dubber_*", "video_extend_*", "demucs_*"]:
+        for f in Path("/tmp").glob(pattern):
+            try:
+                if f.is_dir():
+                    _shutil.rmtree(f, ignore_errors=True)
+                else:
+                    f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Clear Python garbage + model caches
+    gc.collect()
+
+    # Free model memory
+    try:
+        from model_manager import ModelManager
+        mm = ModelManager()
+        mm.unload_current()
+    except Exception:
+        pass
+
+    # Clear torch cache
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    print(f"[cleanup] Job {job_id} fully purged — storage + memory freed")
+    return jsonify({"job_id": job_id, "status": "cleaned"})
 
 
 @app.route("/api/download/<job_id>/<ftype>")

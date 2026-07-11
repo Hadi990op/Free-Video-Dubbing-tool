@@ -393,22 +393,76 @@ def separate_vocals(audio_path: str, temp_dir: str,
 
     import sys
     old_argv = sys.argv
-    sys.argv = [
+    demucs_args = [
         "demucs",
         "--two-stems", "vocals",   # vocals vs no_vocals
         "-n", "htdemucs",          # Hybrid Demucs v4 (best quality)
         "-o", output_dir,          # output directory
+        "--shifts", "1",           # Minimize shifts for speed
         audio_path,
     ]
 
+    # Run Demucs in a subprocess with timeout to prevent hanging on long videos.
+    # Demucs on CPU takes ~1s per 10s of audio, so a 10-min video takes ~60s.
+    # For 30+ min videos, this could take 3+ minutes — set generous timeout.
+    import subprocess as _sp
+
+    # Get audio duration to calculate timeout
     try:
-        demucs_main()
+        dur_result = _sp.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=10)
+        audio_dur = float(dur_result.stdout.strip() or "0")
+    except Exception:
+        audio_dur = 60  # assume 1 min if unknown
+
+    # Timeout: 6x audio duration (Demucs on CPU is ~6x real-time for htdemucs)
+    # Minimum 120s, maximum 1800s (30 min)
+    demucs_timeout = min(1800, max(120, int(audio_dur * 6)))
+
+    # Run Demucs in a separate process so we can kill it if it hangs
+    venv_python = sys.executable
+    # Write args to a temp file to avoid serialization issues
+    import json as _json
+    import tempfile as _tf
+    args_file = _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False, dir=temp_dir)
+    _json.dump(demucs_args, args_file)
+    args_file.close()
+
+    demucs_script = f"""
+import sys, json
+with open({args_file.name!r}) as f:
+    sys.argv = json.load(f)
+from demucs.separate import main as demucs_main
+demucs_main()
+"""
+    try:
+        proc = _sp.Popen(
+            [venv_python, "-c", demucs_script],
+            stdout=_sp.PIPE, stderr=_sp.PIPE)
+        try:
+            stdout, stderr = proc.communicate(timeout=demucs_timeout)
+        except _sp.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            print(f"        Demucs timed out after {demucs_timeout}s, skipping vocal isolation")
+            sys.argv = old_argv
+            return None, None
+        if proc.returncode != 0:
+            print(f"        Demucs failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+            sys.argv = old_argv
+            return None, None
     except Exception as e:
         print(f"        Demucs failed: {e}")
         sys.argv = old_argv
+        try: os.unlink(args_file.name)
+        except: pass
         return None, None
     finally:
         sys.argv = old_argv
+        try: os.unlink(args_file.name)
+        except: pass
 
     # Find output files
     track_name = os.path.splitext(os.path.basename(audio_path))[0]
@@ -723,7 +777,8 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
     print(f"        Audio duration: {audio_duration:.1f}s ({audio_duration/60:.1f} min)")
 
     # Try remote VM first (offload CPU). Fall back to local if unavailable.
-    remote_timeout = min(120, max(30, int(audio_duration * 2)))
+    # For long videos (>5 min), allow up to 600s (10 min) for transcription
+    remote_timeout = min(600, max(30, int(audio_duration * 3)))
     remote_result = None
     try:
         print(f"        Trying remote VM worker (timeout {remote_timeout}s)...")
@@ -743,8 +798,12 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
 
     print(f"        Falling back to local Whisper ({model_size})...")
 
-    # --- Try WhisperX first (better word-level alignment) ---
-    if use_word_alignment:
+    # --- Use faster-whisper directly (has real-time progress, faster on CPU) ---
+    # WhisperX's word-level alignment doubles processing time on low-RAM CPU
+    # and blocks with no progress callback. faster-whisper with word_timestamps=True
+    # gives good-enough timing for dubbing, with live progress reporting.
+    # Only use WhisperX for short clips (<2 min) where alignment is quick.
+    if use_word_alignment and audio_duration < 120:
         try:
             segments, detected_lang = _transcribe_whisperx(
                 audio_path, model_size, audio_duration, progress_callback)
@@ -754,7 +813,7 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
         except Exception as e:
             print(f"        WhisperX error: {e!r}, falling back to faster-whisper...")
 
-    # --- Fallback: faster-whisper ---
+    # --- Primary: faster-whisper (real-time progress, faster on CPU) ---
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
@@ -839,29 +898,40 @@ def _transcribe_whisperx(audio_path: str, model_size: str,
     # Transcribe
     print(f"        Transcribing with WhisperX...")
     audio = whisperx.load_audio(audio_path)
-    result = model.transcribe(audio, batch_size=8, language=None)
+    result = model.transcribe(audio, batch_size=16, language=None)
 
     detected_lang = result.get("language", "en")
     print(f"        [WhisperX] Detected language: {detected_lang}")
+    print(f"        [WhisperX] Found {len(result['segments'])} segments")
 
-    # Word-level alignment
-    print(f"        Running word-level alignment...")
-    try:
-        model_a, metadata = whisperx.load_align_model(
-            language_code=detected_lang, device="cpu")
-        result = whisperx.align(
-            result["segments"], model_a, metadata, audio, device="cpu")
-
-        # Free alignment model
-        del model_a
-        import gc; gc.collect()
-    except Exception as e:
-        print(f"        Word alignment failed ({e!r}), using segment-level timestamps")
-        # Still use the transcription, just without word-level alignment
-
-    # Free WhisperX model
+    # Free WhisperX model BEFORE alignment — saves ~400MB RAM
     del model
+    try:
+        _model_manager.unload_current()
+    except Exception:
+        pass
     import gc; gc.collect()
+
+    # Word-level alignment — OPTIONAL, can be slow on low-RAM CPU.
+    # Skip it if audio is long (>3 min) to save time; faster-whisper's
+    # segment timestamps are good enough for dubbing.
+    if audio_duration > 180:
+        print(f"        Skipping word-level alignment (audio >3min, saves time on CPU)")
+    else:
+        print(f"        Running word-level alignment...")
+        try:
+            model_a, metadata = whisperx.load_align_model(
+                language_code=detected_lang, device="cpu")
+            result = whisperx.align(
+                result["segments"], model_a, metadata, audio, device="cpu",
+                batch_size=32)
+
+            # Free alignment model
+            del model_a
+            import gc; gc.collect()
+        except Exception as e:
+            print(f"        Word alignment failed ({e!r}), using segment-level timestamps")
+            # Still use the transcription, just without word-level alignment
 
     # Convert to our format
     segments = []
@@ -1096,6 +1166,9 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
         try:
             r = requests.post("https://text.pollinations.ai/openai",
                             json=payload, timeout=60)
+            if r.status_code == 429:
+                # Rate limited — don't waste time retrying every batch
+                raise Exception("429 rate limited")
             if r.status_code != 200:
                 raise Exception(f"HTTP {r.status_code}")
 
@@ -1118,9 +1191,10 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
 
         except Exception as e:
             print(f"        LLM batch {batch_start}-{batch_end} failed: {e}")
-            # Don't return None — partial results are still useful.
-            # The caller will check which segments are still None and
-            # fall back to Google Translate for those.
+            # If 429 rate limited, bail out early — no point retrying every batch
+            if "429" in str(e):
+                print(f"        Pollinations rate limited — falling back to Google Translate for all remaining segments")
+                return None
             continue
 
     # If nothing was translated, signal failure
@@ -2298,7 +2372,10 @@ async def generate_tts_segments(segments: list, target_lang: str,
             await task
             async with progress_lock:
                 done_count[0] += 1
-                if progress_callback and (done_count[0] % 3 == 0 or done_count[0] == len(tts_segments)):
+                # Update progress on every clip for Kokoro/voice-cloning (serial, slow)
+                # or every 3rd clip for Edge-TTS (parallel, fast)
+                update_interval = 1 if sem_concurrency <= 2 else 3
+                if progress_callback and (done_count[0] % update_interval == 0 or done_count[0] == len(tts_segments)):
                     progress_callback(done_count[0], len(tts_segments))
 
     tasks_list = [run_with_progress(i, synth_one(i, seg["translated"], ts["audio_path"], ts["voice"],
@@ -2469,12 +2546,18 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             tempo = f"atempo={ratio:.4f}"
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
                        "-vn", "-ac", "2", "-ar", "48000", adj_path]
-            r = subprocess.run(adj_cmd, capture_output=True, text=True)
-            if r.returncode != 0 or not os.path.exists(adj_path) or os.path.getsize(adj_path) == 0:
+            try:
+                r = subprocess.run(adj_cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                r = None
+            if r is None or r.returncode != 0 or not os.path.exists(adj_path) or os.path.getsize(adj_path) == 0:
                 # Fallback: no speed adjustment
                 adj_cmd2 = ["ffmpeg", "-y", "-i", clip_path, "-vn",
                             "-ac", "2", "-ar", "48000", adj_path]
-                subprocess.run(adj_cmd2, capture_output=True, text=True)
+                try:
+                    subprocess.run(adj_cmd2, capture_output=True, text=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    pass
             speed_adjusted += 1
         elif need_slowdown:
             # Slow down to fill the slot (min 0.7x speed)
@@ -2485,13 +2568,19 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             tempo = f"atempo={ratio:.4f}"
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
                        "-vn", "-ac", "2", "-ar", "48000", adj_path]
-            subprocess.run(adj_cmd, capture_output=True, text=True)
+            try:
+                subprocess.run(adj_cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
             speed_adjusted += 1
         else:
             # No speed adjustment needed — just convert format
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
                        "-ac", "2", "-ar", "48000", adj_path]
-            subprocess.run(adj_cmd, capture_output=True, text=True)
+            try:
+                subprocess.run(adj_cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
 
         # Check if still too long after speedup → trim
         adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
@@ -2499,7 +2588,10 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             trim_path = os.path.join(temp_dir, f"trim_{idx}.mp3")
             trim_cmd = ["ffmpeg", "-y", "-i", adj_path, "-t", f"{max_dur:.3f}",
                         "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", trim_path]
-            subprocess.run(trim_cmd, capture_output=True, text=True)
+            try:
+                subprocess.run(trim_cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
             if os.path.exists(trim_path) and os.path.getsize(trim_path) > 0:
                 os.replace(trim_path, adj_path)
                 truncated += 1
@@ -2513,8 +2605,11 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             pad_cmd = ["ffmpeg", "-y", "-i", adj_path,
                        "-af", f"apad=pad_dur={pad_dur:.3f}",
                        "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", pad_path]
-            r = subprocess.run(pad_cmd, capture_output=True, text=True)
-            if r.returncode == 0 and os.path.exists(pad_path) and os.path.getsize(pad_path) > 0:
+            try:
+                r = subprocess.run(pad_cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                r = None
+            if r is not None and r.returncode == 0 and os.path.exists(pad_path) and os.path.getsize(pad_path) > 0:
                 os.replace(pad_path, adj_path)
                 padded += 1
 
@@ -2530,9 +2625,8 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
 
     mixed_path = os.path.join(temp_dir, "mixed_voice.wav")
 
-    # For long videos with many clips (>200), use concat approach which is
-    # more memory-efficient than amix with hundreds of inputs.
-    # For shorter videos, amix is faster and simpler.
+    # amix handles all clips in a single ffmpeg call (fast for up to ~200 clips).
+    # concat approach processes per-clip (slower but handles very long videos).
     use_concat = len(adjusted_clips) > 200
 
     # Compute start times for each clip — always use original timestamps
@@ -2573,62 +2667,122 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
             "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
             mixed_path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"        amix failed, falling back to concat approach...")
+        mix_timeout = max(300, int(total_duration * 2))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=mix_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"        ⚠ amix timed out after {mix_timeout}s, falling back to concat...")
+            result = None
+
+        if result is None or result.returncode != 0:
+            if result:
+                print(f"        amix failed, falling back to concat approach...")
             use_concat = True
 
     if use_concat:
-        # Concat approach: build a single audio track by placing clips at
-        # their correct timestamps with silence in between.
-        # More memory-efficient for 200+ clips.
-        print(f"        Using concat approach for {len(adjusted_clips)} clips...")
-        list_file = os.path.join(temp_dir, "concat_list.txt")
-        with open(list_file, "w") as f:
-            current_pos = 0.0
-            silence_idx = 0
-            clip_idx = 0
-            for ci, (seg, adj_path) in enumerate(adjusted_clips):
-                seg_start = actual_starts[ci]  # use shifted start time
-                # If the previous content already reached/passed this clip's
-                # start, there's overlap — don't insert negative silence;
-                # just place this clip where we are (slight overlap is
-                # acceptable, but we prefer to not move backwards).
-                if seg_start > current_pos + 0.01:
-                    silence_dur = seg_start - current_pos
-                    # unique filename (index-based, never collides)
-                    silence_path = os.path.join(temp_dir, f"silence_{silence_idx:05d}.wav")
-                    silence_idx += 1
-                    s_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                             f"anullsrc=r=48000:cl=stereo", "-t", f"{silence_dur:.4f}",
-                             "-c:a", "pcm_s16le", silence_path]
-                    subprocess.run(s_cmd, capture_output=True, text=True)
-                    if os.path.exists(silence_path) and os.path.getsize(silence_path) > 0:
-                        f.write(f"file '{silence_path}'\n")
-                        current_pos = seg_start
-                    # if silence generation failed, current_pos stays as-is
-                # Convert clip to the same format as the silence (stereo 44100 pcm)
-                clip_wav = os.path.join(temp_dir, f"clip_{clip_idx:05d}.wav")
-                clip_idx += 1
-                # Convert clip with fade in/out to prevent clicks at boundaries
-                clip_dur_s = get_audio_duration(adj_path)
-                fade_out_st = max(clip_dur_s - 0.02, 0)
-                c_cmd = ["ffmpeg", "-y", "-i", adj_path, "-vn",
-                         "-af", f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_st:.4f}:d=0.02",
-                         "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", clip_wav]
-                subprocess.run(c_cmd, capture_output=True, text=True)
-                if os.path.exists(clip_wav) and os.path.getsize(clip_wav) > 0:
-                    f.write(f"file '{clip_wav}'\n")
-                    clip_dur = get_audio_duration(clip_wav)
-                    current_pos = max(current_pos, seg_start) + clip_dur
-                else:
-                    print(f"        ⚠ clip {clip_idx-1} failed to convert, skipping")
+        # Concat approach for long videos (200+ clips).
+        # OPTIMIZED: Instead of spawning 2 ffmpeg processes per clip (silence + convert)
+        # which is extremely slow for 500+ clips, we use a single ffmpeg call with
+        # adelay+amix for the clips, and a single anullsrc+atrim for silence gaps.
+        # This reduces 1000+ ffmpeg calls to just 1-2 calls.
+        print(f"        Using optimized concat for {len(adjusted_clips)} clips...")
 
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-               "-ac", "2", "-ar", "48000", "-sample_fmt", "s16", mixed_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Audio mixing (concat) failed:\n{result.stderr}")
+        # Build a single ffmpeg filter_complex that:
+        # 1. Inputs each clip
+        # 2. Applies fade in/out
+        # 3. Delays each clip to its correct timestamp
+        # 4. Mixes all clips together
+        # This is the same as amix approach but we also add silence padding
+        # at the end to match total_duration
+        FADE_IN_MS = 30
+        FADE_OUT_MS = 20
+        inputs = []
+        filter_parts = []
+        for i, (seg, adj_path) in enumerate(adjusted_clips):
+            inputs.extend(["-i", adj_path])
+            delay_ms = int(actual_starts[i] * 1000)
+            clip_dur_s = get_audio_duration(adj_path)
+            fade_out_start_s = max(clip_dur_s - FADE_OUT_MS / 1000.0, 0)
+            filter_parts.append(
+                f"[{i}:a]afade=t=in:st=0:d={FADE_IN_MS}ms,"
+                f"afade=t=out:st={fade_out_start_s:.4f}:d={FADE_OUT_MS}ms,"
+                f"adelay={delay_ms}|{delay_ms}[d{i}]"
+            )
+        amix_inputs = "".join(f"[d{i}]" for i in range(len(adjusted_clips)))
+        # Add padding to total_duration to ensure full length
+        pad_dur = max(total_duration + 1.0, 0.1)
+        filter_complex = (
+            ";".join(filter_parts)
+            + f";{amix_inputs}amix=inputs={len(adjusted_clips)}:duration=longest:normalize=0,"
+            f"apad=whole_dur={pad_dur:.2f}[a]"
+        )
+
+        cmd = ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", filter_complex,
+            "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
+            "-t", f"{total_duration:.2f}",  # trim to exact duration
+            mixed_path
+        ]
+        # Use a generous timeout for long videos (10 min per 30 min of audio)
+        mix_timeout = max(300, int(total_duration * 2))
+        print(f"        Mixing {len(adjusted_clips)} clips (timeout: {mix_timeout}s)...")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=mix_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"        ⚠ amix timed out after {mix_timeout}s, trying per-clip concat...")
+            result = None
+
+        if result is None or result.returncode != 0:
+            if result:
+                print(f"        amix failed ({result.stderr[-300:]}), falling back to per-clip concat...")
+            # Fallback: original per-clip concat approach (slower but reliable)
+            list_file = os.path.join(temp_dir, "concat_list.txt")
+            with open(list_file, "w") as f:
+                current_pos = 0.0
+                silence_idx = 0
+                clip_idx = 0
+                for ci, (seg, adj_path) in enumerate(adjusted_clips):
+                    seg_start = actual_starts[ci]
+                    if seg_start > current_pos + 0.01:
+                        silence_dur = seg_start - current_pos
+                        silence_path = os.path.join(temp_dir, f"silence_{silence_idx:05d}.wav")
+                        silence_idx += 1
+                        s_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i",
+                                 f"anullsrc=r=48000:cl=stereo", "-t", f"{silence_dur:.4f}",
+                                 "-c:a", "pcm_s16le", silence_path]
+                        try:
+                            subprocess.run(s_cmd, capture_output=True, text=True, timeout=30)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        if os.path.exists(silence_path) and os.path.getsize(silence_path) > 0:
+                            f.write(f"file '{silence_path}'\n")
+                            current_pos = seg_start
+                    clip_wav = os.path.join(temp_dir, f"clip_{clip_idx:05d}.wav")
+                    clip_idx += 1
+                    clip_dur_s = get_audio_duration(adj_path)
+                    fade_out_st = max(clip_dur_s - 0.02, 0)
+                    c_cmd = ["ffmpeg", "-y", "-i", adj_path, "-vn",
+                             "-af", f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_st:.4f}:d=0.02",
+                             "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", clip_wav]
+                    try:
+                        subprocess.run(c_cmd, capture_output=True, text=True, timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if os.path.exists(clip_wav) and os.path.getsize(clip_wav) > 0:
+                        f.write(f"file '{clip_wav}'\n")
+                        clip_dur = get_audio_duration(clip_wav)
+                        current_pos = max(current_pos, seg_start) + clip_dur
+                    else:
+                        print(f"        ⚠ clip {clip_idx-1} failed to convert, skipping")
+
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                   "-ac", "2", "-ar", "48000", "-sample_fmt", "s16", mixed_path]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=mix_timeout)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"Audio mixing timed out after {mix_timeout}s (too many clips)")
+            if result.returncode != 0:
+                raise RuntimeError(f"Audio mixing (concat) failed:\n{result.stderr}")
 
     if not os.path.exists(mixed_path) or os.path.getsize(mixed_path) == 0:
         raise RuntimeError("Audio mixing produced empty output")
@@ -2662,7 +2816,12 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 "-af", voice_filter,
                 "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
                 processed_voice]
-    proc_result = subprocess.run(proc_cmd, capture_output=True, text=True)
+    try:
+        proc_result = subprocess.run(proc_cmd, capture_output=True, text=True,
+                                     timeout=max(300, int(total_duration * 2)))
+    except subprocess.TimeoutExpired:
+        print(f"        ⚠ Audio processing timed out, using raw voice")
+        proc_result = None
     if proc_result.returncode == 0 and os.path.exists(processed_voice) and os.path.getsize(processed_voice) > 0:
         # Replace mixed_path with processed version
         os.replace(processed_voice, mixed_path)
@@ -2724,8 +2883,13 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
                 final_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=max(300, int(total_duration * 2)))
+            except subprocess.TimeoutExpired:
+                print(f"        ⚠ Sidechain mix timed out, trying simple ducking...")
+                result = None
+            if result is not None and result.returncode != 0:
                 # Fallback: simpler sidechain approach
                 print(f"        ⚠ Sidechain filter failed, trying simple ducking...")
                 filter_simple = (
@@ -2737,8 +2901,13 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                        "-filter_complex", filter_simple,
                        "-map", "[a]", "-ac", "2", "-ar", "48000", "-sample_fmt", "s16",
                        final_path]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0 and os.path.exists(final_path):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True,
+                                            timeout=max(300, int(total_duration * 2)))
+                except subprocess.TimeoutExpired:
+                    print(f"        ⚠ Simple ducking also timed out")
+                    result = None
+            if result is not None and result.returncode == 0 and os.path.exists(final_path):
                 # Clean up intermediate files to save disk on long videos
                 for p in [mixed_path, bg_path]:
                     if os.path.exists(p):
@@ -2803,17 +2972,20 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
     video_dur_result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30
     )
     video_dur = float(video_dur_result.stdout.strip() or "0")
     
     audio_dur_result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30
     )
     audio_dur = float(audio_dur_result.stdout.strip() or "0")
     
+    # Calculate generous timeout for mux (video encoding is slow on CPU)
+    mux_timeout = max(600, int(max(video_dur, audio_dur) * 10))
+
     need_extend = extend_video and audio_dur > video_dur + 0.1
     
     if need_extend:
@@ -2971,14 +3143,14 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                            "-vf", f"tpad=stop_mode=clone:stop_duration={extra_dur:.3f}",
                            "-c:a", "aac", "-b:a", "192k",
                            output_path]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=mux_timeout)
                 if result.returncode != 0:
                     cmd_fallback = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
                                     "-map", "0:v", "-map", "1:a",
                                     "-c:v", "libx264", "-crf", "20",
                                     "-c:a", "aac", "-b:a", "192k",
                                     output_path]
-                    result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+                    result = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=mux_timeout)
                     if result.returncode != 0:
                         raise RuntimeError(f"FFmpeg muxing failed:\n{result.stderr}")
         else:
@@ -3000,7 +3172,7 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                        "-c:a", "aac", "-b:a", "192k",
                        output_path]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=mux_timeout)
             if result.returncode != 0:
                 # Fallback without tpad
                 print(f"        tpad failed, trying alternate approach...")
@@ -3009,7 +3181,7 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                                 "-c:v", "libx264", "-crf", "20",
                                 "-c:a", "aac", "-b:a", "192k",
                                 output_path]
-                result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+                result = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=mux_timeout)
                 if result.returncode != 0:
                     raise RuntimeError(f"FFmpeg muxing failed:\n{result.stderr}")
     else:
@@ -3030,14 +3202,14 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
                    "-c:a", "aac", "-b:a", "192k",
                    output_path]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=mux_timeout)
         if result.returncode != 0:
             cmd_fallback = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
                             "-map", "0:v", "-map", "1:a",
                             "-c:v", "libx264", "-crf", "20",
                             "-c:a", "aac", "-b:a", "192k",
                             output_path]
-            result2 = subprocess.run(cmd_fallback, capture_output=True, text=True)
+            result2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=mux_timeout)
             if result2.returncode != 0:
                 raise RuntimeError(f"FFmpeg muxing failed:\n{result2.stderr}")
     
@@ -3045,7 +3217,7 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str,
     out_dur_result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", output_path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30
     )
     out_dur = float(out_dur_result.stdout.strip() or "0")
     print(f"        Output duration: {out_dur:.1f}s")
@@ -3310,6 +3482,15 @@ def dub_video(
 
             log(2, f"Transcribed {len(segments)} segments (language: {source_lang})",
                 total_duration, total_duration)
+
+            # Free transcription/diarization models from memory before next stage
+            import gc as _gc
+            try:
+                from model_manager import _model_manager
+                _model_manager.unload_current()
+            except Exception:
+                pass
+            _gc.collect()
 
             if job_dir:
                 save_checkpoint(job_dir, 2, {

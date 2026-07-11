@@ -51,3 +51,5 @@ translation_checkpoint.json
 .hf_token
 *.backup
 *.bak
+*.stable_backup
+*.backup
