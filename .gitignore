@@ -49,3 +49,5 @@ token.txt
 checkpoint.json
 translation_checkpoint.json
 .hf_token
+*.backup
+*.bak
