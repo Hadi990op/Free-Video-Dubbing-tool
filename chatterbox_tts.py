@@ -28,8 +28,9 @@ from typing import Optional
 
 # HF Space IDs for Chatterbox Multilingual
 CHATTERBOX_SPACES = {
-    "hi": "ResembleAI/Chatterbox-Multilingual-TTS-hi",    # Hindi-specific
-    "multi": "ResembleAI/Chatterbox-Multilingual-TTS",     # All 23 languages
+    "v3": "ResembleAI/Chatterbox-Multilingual-TTS-V3",  # V3 — 23 languages, ZeroGPU
+    "hi": "ResembleAI/Chatterbox-Multilingual-TTS-hi",   # Hindi-specific
+    "multi": "ResembleAI/Chatterbox-Multilingual-TTS",   # All 23 languages (non-V3)
 }
 
 # Languages supported by Chatterbox Multilingual V3
@@ -54,8 +55,8 @@ def get_space_for_lang(target_lang: str) -> str:
     if target_lang == "hi":
         return CHATTERBOX_SPACES["hi"]
     if target_lang in CHATTERBOX_SUPPORTED_LANGS:
-        return CHATTERBOX_SPACES["multi"]
-    return CHATTERBOX_SPACES["multi"]  # Fallback
+        return CHATTERBOX_SPACES["v3"]  # Use V3 for all supported languages
+    return CHATTERBOX_SPACES["v3"]  # Fallback to V3
 
 
 def clone_voice(text: str, ref_audio_path: str, out_path: str,
@@ -141,15 +142,30 @@ def clone_voice(text: str, ref_audio_path: str, out_path: str,
         try:
             client = Client(space_id, verbose=False)
 
-            result = client.predict(
-                text_input=text,
-                audio_prompt_path_input=handle_file(ref_wav),
-                exaggeration_input=exaggeration,
-                temperature_input=temperature,
-                seed_num_input=seed if seed > 0 else 0,
-                cfgw_input=cfgw,
-                api_name="/generate_tts_audio"
-            )
+            # V3 space has language_id_input parameter; non-V3 doesn't
+            # Try V3 API first (with language_id), fallback to non-V3 API
+            try:
+                result = client.predict(
+                    text_input=text,
+                    audio_prompt_path_input=handle_file(ref_wav),
+                    language_id_input=target_lang,
+                    exaggeration_input=exaggeration,
+                    temperature_input=temperature,
+                    seed_num_input=seed if seed > 0 else 0,
+                    cfgw_input=cfgw,
+                    api_name="/generate_tts_audio"
+                )
+            except Exception as ve:
+                # V3 API failed (wrong param count) — try without language_id
+                result = client.predict(
+                    text_input=text,
+                    audio_prompt_path_input=handle_file(ref_wav),
+                    exaggeration_input=exaggeration,
+                    temperature_input=temperature,
+                    seed_num_input=seed if seed > 0 else 0,
+                    cfgw_input=cfgw,
+                    api_name="/generate_tts_audio"
+                )
 
             # Extract the audio path from the result
             if isinstance(result, tuple) and len(result) >= 1:

@@ -17,6 +17,13 @@ from pathlib import Path
 import shutil
 import threading
 
+# Non-speech sound preservation (laughs, sighs, reactions)
+try:
+    from non_speech import get_non_speech_clips, mix_non_speech_into_dub
+except ImportError:
+    get_non_speech_clips = None
+    mix_non_speech_into_dub = None
+
 # ---------------------------------------------------------------------------
 # Checkpoint / Resume system
 # ---------------------------------------------------------------------------
@@ -2118,8 +2125,8 @@ async def generate_tts_segments(segments: list, target_lang: str,
                 return
             print(f"        ⚠ Voice clone failed for clip {idx}, trying Kokoro/edge-tts")
 
-        # --- Kokoro TTS (primary, high quality) ---
-        if use_kokoro and not use_voice_cloning:
+        # --- Kokoro TTS (primary for non-cloning, fallback for cloning) ---
+        if use_kokoro:
             try:
                 kokoro_ok = await loop_run_kokoro(
                     text, out_path, target_lang, seg_voice, target_duration)
@@ -2128,7 +2135,7 @@ async def generate_tts_segments(segments: list, target_lang: str,
             except Exception as e:
                 print(f"        ⚠ Kokoro TTS failed for clip {idx}: {e!r}")
 
-        # --- Edge-TTS (fallback) ---
+        # --- Edge-TTS (final fallback) ---
         await synth_one_edge(idx, text, out_path, seg_voice, target_duration)
 
     # Create all tasks
@@ -2311,21 +2318,30 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                         temp_dir: str, keep_bg: bool = False,
                         original_audio_path: str = None,
                         extend_video: bool = False,
-                        bg_volume: float = 0.35) -> tuple:
+                        bg_volume: float = 0.35,
+                        non_speech_clips: list = None) -> tuple:
     """
     Build the final dubbed audio track by placing TTS segments at correct
-    timestamps.
+    timestamps — with LIP SYNC.
 
-    If extend_video=True: clips are NOT truncated or speed-adjusted.
-    The audio track will be as long as the longest clip placement requires.
-    The video will be extended (freeze frames) to match the audio duration.
-    
-    If extend_video=False: clips are speed-adjusted and truncated to fit
-    the original video timeline (legacy behavior).
+    LIP SYNC MODE (default): Each TTS clip is speed-adjusted to fit exactly
+    within its original speech segment's time slot. This means:
+      - The dubbed audio starts at the exact same moment the original speaker
+        started talking → lip movements match audio
+      - The dubbed audio ends at the exact same moment → no overlap with next
+      - Speed adjustment is kept within 0.7x-1.5x to avoid distortion
+      - If the clip is slightly too long, it's trimmed (last few words may be cut)
+      - If the clip is slightly too short, silence is padded at the end
+
+    NON-SPEECH PRESERVATION: If non_speech_clips is provided, these clips
+    (laughs, sighs, reactions) are mixed into the dubbed track at their
+    original timestamps. This makes the dub feel natural.
+
+    BACKGROUND MUSIC: If keep_bg and original_audio_path are provided,
+    background music is mixed with sidechain ducking (music dips during
+    speech, comes back up during pauses).
 
     Returns: (path to the final mixed audio WAV, list of video_shift_points)
-    video_shift_points: list of (timestamp, freeze_duration) tuples for
-    per-gap freeze frames, or empty list if not extending.
     """
     print(f"  [5/5] Building dubbed audio track...")
 
@@ -2343,120 +2359,104 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
 
     print(f"        {len(valid_clips)}/{len(tts_segments)} valid clips to mix")
 
-    if extend_video:
-        # EXTEND VIDEO MODE: Professional dubbing approach.
-        # Each clip gets its FULL duration — no cutting.
-        # If a clip extends past the next clip's original start time, we
-        # SHIFT the next clip later (push-down). The video timeline stretches
-        # to accommodate full speech. Gaps between clips become freeze-frames.
-        adjusted_clips = []
-        for ci, (seg, clip_path, clip_dur) in enumerate(valid_clips):
-            idx = seg.get("audio_path", "").split("_")[-1].replace(".mp3", "")
-            adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
-            # Convert to standard format — NO trimming
+    # ===================================================================
+    # LIP SYNC MODE: Speed-adjust each clip to fit its original time slot
+    # ===================================================================
+    # This is how professional dubbing works — the dubbed voice starts at
+    # the exact same moment the original speaker's lips move, and ends when
+    # they stop. Speed is adjusted (within 0.7x-1.5x) to fit the time slot.
+    # If the clip is still too long after max speedup, it's trimmed.
+    # If the clip is shorter than the slot, silence is padded at the end.
+    #
+    # This replaces the old "extend video" approach which pushed clips later
+    # and froze video frames — causing audio/video desync.
+    # ===================================================================
+    adjusted_clips = []
+    speed_adjusted = 0
+    truncated = 0
+    padded = 0
+    
+    for ci, (seg, clip_path, clip_dur) in enumerate(valid_clips):
+        slot_duration = seg["end"] - seg["start"]
+        
+        # Calculate available time slot (don't overlap with next segment)
+        if ci + 1 < len(valid_clips):
+            next_start = valid_clips[ci + 1][0]["start"]
+        else:
+            next_start = seg["end"] + 1.0
+        max_dur = max(next_start - seg["start"] - 0.03, 0.2)  # 30ms gap
+
+        idx = seg.get("audio_path", "").split("_")[-1].replace(".mp3", "")
+        adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
+
+        # Decide if we need speed adjustment
+        # If clip is longer than slot → speed up (but max 1.5x)
+        # If clip is shorter than slot → keep as-is (pad with silence)
+        need_speedup = clip_dur > slot_duration * 1.05  # 5% tolerance
+        need_slowdown = clip_dur < slot_duration * 0.85 and slot_duration > 0.5
+
+        if need_speedup:
+            # Speed up to fit the slot (max 1.5x speedup)
+            target_dur = max(slot_duration * 0.95, min(max_dur, clip_dur / 1.3))
+            ratio = clip_dur / target_dur
+            if ratio > 1.5:
+                ratio = 1.5  # Max 1.5x speedup
+            tempo = f"atempo={ratio:.4f}"
+            adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
+                       "-vn", "-ac", "2", "-ar", "48000", adj_path]
+            r = subprocess.run(adj_cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(adj_path) or os.path.getsize(adj_path) == 0:
+                # Fallback: no speed adjustment
+                adj_cmd2 = ["ffmpeg", "-y", "-i", clip_path, "-vn",
+                            "-ac", "2", "-ar", "48000", adj_path]
+                subprocess.run(adj_cmd2, capture_output=True, text=True)
+            speed_adjusted += 1
+        elif need_slowdown:
+            # Slow down to fill the slot (min 0.7x speed)
+            target_dur = slot_duration * 0.95
+            ratio = clip_dur / target_dur
+            if ratio < 0.7:
+                ratio = 0.7  # Min 0.7x speed
+            tempo = f"atempo={ratio:.4f}"
+            adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
+                       "-vn", "-ac", "2", "-ar", "48000", adj_path]
+            subprocess.run(adj_cmd, capture_output=True, text=True)
+            speed_adjusted += 1
+        else:
+            # No speed adjustment needed — just convert format
             adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
                        "-ac", "2", "-ar", "48000", adj_path]
             subprocess.run(adj_cmd, capture_output=True, text=True)
-            if not (os.path.exists(adj_path) and os.path.getsize(adj_path) > 0):
-                continue
+
+        # Check if still too long after speedup → trim
+        adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
+        if adj_dur > max_dur:
+            trim_path = os.path.join(temp_dir, f"trim_{idx}.mp3")
+            trim_cmd = ["ffmpeg", "-y", "-i", adj_path, "-t", f"{max_dur:.3f}",
+                        "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", trim_path]
+            subprocess.run(trim_cmd, capture_output=True, text=True)
+            if os.path.exists(trim_path) and os.path.getsize(trim_path) > 0:
+                os.replace(trim_path, adj_path)
+                truncated += 1
+
+        # If clip is shorter than slot → pad with silence at the end
+        # (so the next clip starts at the right time, maintaining sync)
+        adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
+        if adj_dur > 0 and adj_dur < slot_duration - 0.1 and slot_duration > 0.5:
+            pad_dur = slot_duration - adj_dur
+            pad_path = os.path.join(temp_dir, f"pad_{idx}.mp3")
+            pad_cmd = ["ffmpeg", "-y", "-i", adj_path,
+                       "-af", f"apad=pad_dur={pad_dur:.3f}",
+                       "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", pad_path]
+            r = subprocess.run(pad_cmd, capture_output=True, text=True)
+            if r.returncode == 0 and os.path.exists(pad_path) and os.path.getsize(pad_path) > 0:
+                os.replace(pad_path, adj_path)
+                padded += 1
+
+        if os.path.exists(adj_path) and os.path.getsize(adj_path) > 0:
             adjusted_clips.append((seg, adj_path))
 
-        # Now adjust timestamps: if clip N extends past clip N+1's start,
-        # push clip N+1 (and all subsequent) later by the overlap amount.
-        # This preserves full audio — nothing is cut.
-        shifted = 0
-        total_shift = 0.0
-        for ci in range(len(adjusted_clips) - 1):
-            seg = adjusted_clips[ci][0]
-            adj_path = adjusted_clips[ci][1]
-            clip_dur = get_audio_duration(adj_path)
-            actual_start = seg["start"] + total_shift
-            actual_end = actual_start + clip_dur
-            next_seg = adjusted_clips[ci + 1][0]
-            next_start = next_seg["start"] + total_shift
-            if actual_end > next_start:
-                # This clip overlaps with the next one — push next clip
-                overlap = actual_end - next_start + 0.05  # 50ms gap
-                total_shift += overlap
-                shifted += 1
-                print(f"        Clip {ci} ends at {actual_end:.2f}s, next starts at {next_start:.2f}s → shift +{overlap:.2f}s")
-
-        # Apply the accumulated shift to all clip start times
-        if total_shift > 0:
-            for ci, (seg, adj_path) in enumerate(adjusted_clips):
-                # Only shift clips AFTER the first overlap point
-                # (clips before the first overlap keep original timing)
-                pass  # shift is applied in the mixing step below
-
-        print(f"        Extend video mode — {len(adjusted_clips)} clips, {shifted} clips shifted, total extension: {total_shift:.1f}s")
-    else:
-        # LEGACY BEHAVIOR: Speed-adjust and truncate to fit original timeline
-        adjusted_clips = []
-        speed_adjusted = 0
-        truncated = 0
-        for ci, (seg, clip_path, clip_dur) in enumerate(valid_clips):
-            slot_duration = seg["end"] - seg["start"]
-
-            if ci + 1 < len(valid_clips):
-                next_start = valid_clips[ci + 1][0]["start"]
-            else:
-                next_start = seg["end"] + 1.0
-            max_dur = max(next_start - seg["start"] - 0.05, 0.2)
-
-            idx = seg.get("audio_path", "").split("_")[-1].replace(".mp3", "")
-            adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
-
-            need_speedup = clip_dur > slot_duration * 1.15
-            need_slowdown = clip_dur < slot_duration * 0.8 and slot_duration > 0.5
-
-            if need_speedup:
-                target_dur = max(slot_duration * 0.95, clip_dur / 1.3)
-                ratio = clip_dur / target_dur
-                if ratio > 1.3:
-                    ratio = 1.3
-                tempo = f"atempo={ratio:.4f}"
-                adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
-                           "-vn", "-ac", "2", "-ar", "48000", adj_path]
-                r = subprocess.run(adj_cmd, capture_output=True, text=True)
-                if r.returncode != 0 or not os.path.exists(adj_path) or os.path.getsize(adj_path) == 0:
-                    adj_cmd2 = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                                "-ac", "2", "-ar", "48000", adj_path]
-                    subprocess.run(adj_cmd2, capture_output=True, text=True)
-                speed_adjusted += 1
-            elif need_slowdown:
-                target_dur = slot_duration * 0.95
-                ratio = clip_dur / target_dur
-                if ratio < 0.7:
-                    ratio = 0.7
-                tempo = atempo_filter(clip_dur, clip_dur / ratio)
-                if tempo:
-                    adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-filter:a", tempo,
-                               "-vn", "-ac", "2", "-ar", "48000", adj_path]
-                    subprocess.run(adj_cmd, capture_output=True, text=True)
-                else:
-                    adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                               "-ac", "2", "-ar", "48000", adj_path]
-                    subprocess.run(adj_cmd, capture_output=True, text=True)
-                speed_adjusted += 1
-            else:
-                adj_cmd = ["ffmpeg", "-y", "-i", clip_path, "-vn",
-                           "-ac", "2", "-ar", "48000", adj_path]
-                subprocess.run(adj_cmd, capture_output=True, text=True)
-
-            adj_dur = get_audio_duration(adj_path) if os.path.exists(adj_path) else 0
-            if adj_dur > max_dur:
-                trim_path = os.path.join(temp_dir, f"trim_{idx}.mp3")
-                trim_cmd = ["ffmpeg", "-y", "-i", adj_path, "-t", f"{max_dur:.3f}",
-                            "-vn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", trim_path]
-                subprocess.run(trim_cmd, capture_output=True, text=True)
-                if os.path.exists(trim_path) and os.path.getsize(trim_path) > 0:
-                    os.replace(trim_path, adj_path)
-                    truncated += 1
-
-            if os.path.exists(adj_path) and os.path.getsize(adj_path) > 0:
-                adjusted_clips.append((seg, adj_path))
-
-        print(f"        Speed-adjusted {speed_adjusted}, truncated {truncated} clips to prevent overlap")
+    print(f"        Lip-sync: {speed_adjusted} speed-adjusted, {truncated} trimmed, {padded} padded")
 
     if not adjusted_clips:
         raise RuntimeError("No clips could be adjusted.")
@@ -2470,36 +2470,12 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
     # For shorter videos, amix is faster and simpler.
     use_concat = len(adjusted_clips) > 200
 
-    # Compute actual (shifted) start times for each clip.
-    # In extend_video mode, clips that overlap get pushed later.
-    # In legacy mode, start times are original.
+    # Compute start times for each clip — always use original timestamps
+    # (lip sync: each clip starts at the original speech segment's start)
     actual_starts = []
-    video_shift_points = []  # (timestamp_in_original, freeze_duration)
-    if extend_video:
-        running_shift = 0.0
-        for ci, (seg, adj_path) in enumerate(adjusted_clips):
-            orig_start = float(seg["start"])
-            adj_dur = get_audio_duration(adj_path)
-            actual_start = orig_start + running_shift
-            actual_end = actual_start + adj_dur
-            actual_starts.append(actual_start)
-            # Check if this clip overlaps with the next one
-            if ci + 1 < len(adjusted_clips):
-                next_orig_start = float(adjusted_clips[ci + 1][0]["start"])
-                next_actual_start = next_orig_start + running_shift
-                if actual_end > next_actual_start:
-                    overlap = actual_end - next_actual_start + 0.05
-                    running_shift += overlap
-                    # Record shift point: freeze at the end of this clip's
-                    # original segment, for `overlap` seconds
-                    freeze_ts = float(seg["end"])
-                    video_shift_points.append((freeze_ts, overlap))
-        if running_shift > 0:
-            print(f"        Total timeline extension: {running_shift:.1f}s (video will freeze-frame)")
-            print(f"        Shift points: {[(f'{t:.1f}s', f'{d:.1f}s') for t,d in video_shift_points[:5]]}")
-    else:
-        for seg, adj_path in adjusted_clips:
-            actual_starts.append(float(seg["start"]))
+    video_shift_points = []  # empty — no video extension needed
+    for seg, adj_path in adjusted_clips:
+        actual_starts.append(float(seg["start"]))
 
     if not use_concat:
         # amix approach: each clip gets adelay + fade in/out, then amix all at once.
@@ -2702,6 +2678,14 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                 for p in [mixed_path, bg_path]:
                     if os.path.exists(p):
                         os.remove(p)
+                # Mix non-speech sounds (laughs, sighs, reactions)
+                if non_speech_clips:
+                    ns_output = os.path.join(temp_dir, "with_nonspeech.wav")
+                    final_with_ns = mix_non_speech_into_dub(
+                        final_path, non_speech_clips, ns_output, volume=0.7)
+                    if final_with_ns != final_path and os.path.exists(final_with_ns):
+                        os.replace(final_with_ns, final_path)
+                    print(f"        ✅ Non-speech sounds (laughs, sighs) preserved in dub")
                 return (final_path, video_shift_points)
 
         return (mixed_path, video_shift_points)
@@ -2721,6 +2705,14 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
                     os.remove(os.path.join(temp_dir, f))
                 except Exception:
                     pass
+        # Mix non-speech sounds (laughs, sighs, reactions)
+        if non_speech_clips:
+            ns_output = os.path.join(temp_dir, "with_nonspeech_no_bg.wav")
+            final_with_ns = mix_non_speech_into_dub(
+                mixed_path, non_speech_clips, ns_output, volume=0.7)
+            if final_with_ns != mixed_path and os.path.exists(final_with_ns):
+                os.replace(final_with_ns, mixed_path)
+            print(f"        ✅ Non-speech sounds (laughs, sighs) preserved in dub")
         return (mixed_path, video_shift_points)
 
 
@@ -3427,6 +3419,25 @@ def dub_video(
             if missing > 0:
                 print(f"        Generated {missing} silence clips for missing TTS")
 
+        # --- Stage 4.5: Extract non-speech sounds (laughs, sighs, reactions) ---
+        non_speech_clips = None
+        if get_non_speech_clips and segments:
+            log(4, f"  [4.5] Extracting non-speech sounds (laughs, sighs, reactions)...", 0, 1)
+            # Use the ORIGINAL full audio (not isolated vocals) to extract
+            # non-speech sounds. Demucs may reduce the volume of non-speech
+            # sounds (laughs, sighs) during vocal isolation. Using the original
+            # audio preserves the full energy of these sounds.
+            ns_audio_path = audio_wav
+            try:
+                non_speech_clips = get_non_speech_clips(
+                    ns_audio_path, segments, total_duration, temp_dir,
+                    min_duration=0.2,
+                )
+                log(4, f"Non-speech sounds: {len(non_speech_clips or [])} clips extracted", 1, 1)
+            except Exception as e:
+                print(f"        ⚠ Non-speech extraction failed: {e!r}")
+                non_speech_clips = None
+
         # Generate SRT
         srt_path = None
         if generate_srt_file:
@@ -3460,6 +3471,7 @@ def dub_video(
                 original_audio_path=bg_audio_path,
                 extend_video=extend_video,
                 bg_volume=0.35 if keep_background_music else 0.15,
+                non_speech_clips=non_speech_clips,
             )
             log(5, f"Dubbed audio track built", 1, 1)
 

@@ -485,9 +485,10 @@ HTML_TEMPLATE = r"""
             </div>
             <div style="font-size: 12px; opacity: 0.6; margin-top: 6px;">
                 💡 <b>Preserve Background</b>: Uses AI (Demucs) to separate speech from background music/SFX. Only the speech is dubbed, background audio is preserved with professional sidechain ducking. <b>ON by default.</b><br>
-                💡 <b>Intelligent Voice Detection</b>: AI automatically detects each speaker's gender (male/female/child) from voice pitch and assigns the best matching voice.<br>
+                💡 <b>Non-Speech Sounds</b>: Automatically detects and preserves laughs, sighs, gasps, and reactions from the original audio. These are mixed back into the dubbed track at their original timestamps — making the dub feel natural.<br>
+                💡 <b>Lip Sync</b>: Each dubbed audio clip is speed-adjusted to fit the original speaker's time slot exactly. The dubbed voice starts and ends at the same moment as the original — lips match audio.<br>
                 💡 <b>Voice Cloning</b>: Uses Chatterbox Multilingual V3 (ZeroGPU) to clone each speaker's original voice and speaks the translated text in that voice — preserves speaker identity across languages.<br>
-                💡 <b>Extend Video</b>: When dubbed audio is longer than original, the video is extended (last frame frozen) instead of cutting audio.
+                💡 <b>Intelligent Voice Detection</b>: AI detects each speaker's gender (male/female/child) from voice pitch and assigns the best matching voice.
             </div>
         </div>
 
