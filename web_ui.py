@@ -338,13 +338,13 @@ HTML_TEMPLATE = r"""
 <body>
 <div class="container">
     <header>
-        <h1>🎬 Free Video Dubber</h1>
-        <p>AI-Powered Video Translation & Dubbing — 100% Free, No API Keys</p>
+        <h1>🎬 Pro Video Dubber</h1>
+        <p>AI-Powered Video Translation & Dubbing — SOTA Quality, 100% Free</p>
         <div class="badges">
-            <span class="badge">🎙️ Whisper AI</span>
-            <span class="badge">🌍 Google Translate</span>
-            <span class="badge">🔊 Edge TTS</span>
-            <span class="badge">🎞️ FFmpeg</span>
+            <span class="badge">🎙️ WhisperX</span>
+            <span class="badge">🧠 GPT-OSS Translation</span>
+            <span class="badge">🔊 Kokoro TTS</span>
+            <span class="badge">🎭 Voice Cloning</span>
             <span class="badge green">✅ $0 Cost</span>
         </div>
     </header>
@@ -417,7 +417,7 @@ HTML_TEMPLATE = r"""
                 <option value="base" selected>✅ Base (balanced — recommended)</option>
                 <option value="small">🎯 Small (better accuracy)</option>
                 <option value="medium">🔬 Medium (high accuracy, slow)</option>
-                <option value="large">🏆 Large (best accuracy, very slow)</option>
+                <option value="large">🏆 Large-v3 (best accuracy, very slow)</option>
             </select>
         </div>
 
@@ -477,9 +477,17 @@ HTML_TEMPLATE = r"""
                     🎬 Extend video to fit audio (freeze-frame, no audio cutting)
                 </label>
             </div>
+            <div class="toggle-row" style="margin-top: 8px;">
+                <label class="toggle">
+                    <input type="checkbox" id="keepBg" checked>
+                    🎵 Preserve background audio (music, sound effects, ambient sounds)
+                </label>
+            </div>
             <div style="font-size: 12px; opacity: 0.6; margin-top: 6px;">
-                💡 <b>Voice Cloning</b>: Uses AI to clone each speaker's original voice and speaks the translated text in that voice — studio-quality, preserves speaker identity.<br>
-                💡 <b>Extend Video</b>: When dubbed audio is longer than original, the video is extended (last frame frozen) instead of cutting audio. Disable to use old behavior (speed up/cut audio).
+                💡 <b>Preserve Background</b>: Uses AI (Demucs) to separate speech from background music/SFX. Only the speech is dubbed, background audio is preserved with professional sidechain ducking. <b>ON by default.</b><br>
+                💡 <b>Intelligent Voice Detection</b>: AI automatically detects each speaker's gender (male/female/child) from voice pitch and assigns the best matching voice.<br>
+                💡 <b>Voice Cloning</b>: Uses Chatterbox Multilingual V3 (ZeroGPU) to clone each speaker's original voice and speaks the translated text in that voice — preserves speaker identity across languages.<br>
+                💡 <b>Extend Video</b>: When dubbed audio is longer than original, the video is extended (last frame frozen) instead of cutting audio.
             </div>
         </div>
 

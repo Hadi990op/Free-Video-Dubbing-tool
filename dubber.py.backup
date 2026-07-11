@@ -338,15 +338,8 @@ LANG_NAMES = {
 # ---------------------------------------------------------------------------
 
 def extract_audio(video_path: str, output_wav: str) -> None:
-    """Extract audio from video as 16kHz mono WAV (Whisper format).
-    
-    For better quality, we extract at 48kHz stereo first, then downmix
-    to 16kHz mono for Whisper. The 48kHz version is kept for reference
-    audio extraction (voice cloning) and background music mixing.
-    """
+    """Extract audio from video as 16kHz mono WAV (Whisper format)."""
     print(f"  [1/5] Extracting audio from video...")
-    
-    # Extract 16kHz mono for Whisper (primary use)
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-ac", "1", "-ar", "16000",
@@ -685,17 +678,10 @@ def transcribe_remote(audio_path, model_size="base", language=None, timeout=25):
 
 
 def transcribe_audio(audio_path: str, model_size: str = "base",
-                      progress_callback=None,
-                      use_word_alignment: bool = True) -> dict:
+                      progress_callback=None) -> dict:
     """
-    Transcribe audio using faster-whisper with optional WhisperX word-level alignment.
-    
-    Word-level alignment provides precise per-word timestamps, enabling:
-    - Better audio segment timing for dubbing
-    - More accurate speech-to-speech timing matching
-    - Reduced over/underlap between dubbed segments
-    
-    Returns dict with segments: [{start, end, text, words?}, ...]
+    Transcribe audio using faster-whisper.
+    Returns dict with segments: [{start, end, text}, ...]
     progress_callback(current_count, total_estimate, preview_text) called periodically.
 
     Progress is timestamp-based: seg.start / audio_duration.
@@ -735,19 +721,6 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
         return {"segments": segments, "source_lang": detected_lang}
 
     print(f"        Falling back to local Whisper ({model_size})...")
-
-    # --- Try WhisperX first (better word-level alignment) ---
-    if use_word_alignment:
-        try:
-            segments, detected_lang = _transcribe_whisperx(
-                audio_path, model_size, audio_duration, progress_callback)
-            if segments:
-                return {"segments": segments, "source_lang": detected_lang}
-            print(f"        WhisperX failed, falling back to faster-whisper...")
-        except Exception as e:
-            print(f"        WhisperX error: {e!r}, falling back to faster-whisper...")
-
-    # --- Fallback: faster-whisper ---
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
@@ -791,6 +764,7 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
     print(f"        Found {len(segments)} speech segments")
 
     # Free Whisper model from memory — important for long videos.
+    # The model can use 500MB-2GB RAM depending on size.
     del model
     import gc
     gc.collect()
@@ -800,107 +774,17 @@ def transcribe_audio(audio_path: str, model_size: str = "base",
     return {"segments": segments, "source_lang": detected_lang}
 
 
-def _transcribe_whisperx(audio_path: str, model_size: str,
-                          audio_duration: float,
-                          progress_callback=None) -> tuple:
-    """Transcribe using WhisperX with word-level alignment.
-    
-    WhisperX uses:
-    - faster-whisper for initial transcription
-    - wav2vec2 for forced word-level alignment
-    
-    Returns (segments, detected_language) where segments include
-    per-word timestamps.
-    
-    Falls back to None if WhisperX is not available or fails.
-    """
-    import whisperx
-    from model_manager import _model_manager
-
-    # Map our model sizes to WhisperX-compatible sizes
-    wx_size = model_size
-    if model_size == "large":
-        wx_size = "large-v3"
-
-    # Load model via ModelManager (swaps out any other loaded model)
-    def _load():
-        return whisperx.load_model(wx_size, device="cpu", compute_type="int8")
-
-    print(f"        Loading WhisperX ({wx_size}) via ModelManager...")
-    model = _model_manager.load_model(f"whisperx-{wx_size}", _load)
-
-    # Transcribe
-    print(f"        Transcribing with WhisperX...")
-    audio = whisperx.load_audio(audio_path)
-    result = model.transcribe(audio, batch_size=8, language=None)
-
-    detected_lang = result.get("language", "en")
-    print(f"        [WhisperX] Detected language: {detected_lang}")
-
-    # Word-level alignment
-    print(f"        Running word-level alignment...")
-    try:
-        model_a, metadata = whisperx.load_align_model(
-            language_code=detected_lang, device="cpu")
-        result = whisperx.align(
-            result["segments"], model_a, metadata, audio, device="cpu")
-
-        # Free alignment model
-        del model_a
-        import gc; gc.collect()
-    except Exception as e:
-        print(f"        Word alignment failed ({e!r}), using segment-level timestamps")
-        # Still use the transcription, just without word-level alignment
-
-    # Free WhisperX model
-    del model
-    import gc; gc.collect()
-
-    # Convert to our format
-    segments = []
-    for seg in result["segments"]:
-        text = seg["text"].strip()
-        if text:
-            entry = {
-                "start": round(seg["start"], 3),
-                "end": round(seg["end"], 3),
-                "text": text,
-            }
-            # Include word-level timestamps if available
-            if "words" in seg and seg["words"]:
-                entry["words"] = [
-                    {"word": w.get("word", ""),
-                     "start": round(w.get("start", 0), 3),
-                     "end": round(w.get("end", 0), 3)}
-                    for w in seg["words"]
-                ]
-            segments.append(entry)
-
-            if progress_callback:
-                progress_callback(len(segments), seg["start"], audio_duration, text[:60])
-
-    print(f"        [WhisperX] Found {len(segments)} segments")
-    if progress_callback:
-        progress_callback(len(segments), audio_duration, audio_duration, None)
-
-    return segments, detected_lang
-
-
 # ---------------------------------------------------------------------------
 # Step 3: Translate text segments
 # ---------------------------------------------------------------------------
 
 # Languages that should be romanized (written in Latin script like daily conversation)
-# For these languages, we generate BOTH Devanagari (for Kokoro TTS) and Roman (for Edge-TTS)
 ROMAN_LANGS = {"hi", "ur"}
-
-# Languages where Kokoro TTS is available and needs native script
-KOKORO_NATIVE_LANGS = {"hi", "zh", "ja"}
 
 # Language full names for LLM prompts
 LANG_FULL_NAMES = {
-    "hi": "Hindi (Devanagari script — written in Hindi script like 'आप कैसे हैं?')",
-    "ur": "Urdu (Urdu script — written in Urdu script)",
+    "hi": "Hindi (Roman script / Hinglish — written in Latin letters like 'aap kaise hain?')",
+    "ur": "Urdu (Roman script / Roman Urdu — written in Latin letters like 'aap kaise hain?')",
     "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
     "pt": "Portuguese", "ru": "Russian", "ja": "Japanese", "ko": "Korean",
     "zh": "Chinese (Simplified)", "ar": "Arabic", "tr": "Turkish",
@@ -914,12 +798,6 @@ LANG_FULL_NAMES = {
     "en": "English",
 }
 
-# For Romanized languages, also provide a romanized name for Edge-TTS
-LANG_ROMAN_NAMES = {
-    "hi": "Hindi (Roman script / Hinglish — written in Latin letters like 'aap kaise hain?')",
-    "ur": "Urdu (Roman script / Roman Urdu — written in Latin letters like 'aap kaise hain?')",
-}
-
 
 def llm_translate_batch(segments: list, target_lang: str, source_lang: str = None,
                         batch_size: int = 15) -> list:
@@ -927,77 +805,32 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
     Sends segments in batches with surrounding context for better translation.
     Returns list of translated strings (same order as input).
 
-    Uses GPT-OSS-20B via Pollinations — context-aware, natural, idiomatic.
-    Quality comparable to professional dubbing translation.
-
     Advantages over Google Translate:
     - Context-aware: uses surrounding sentences for correct pronouns/tense
     - Idiom-aware: translates idioms naturally, not literally
     - Conversational: natural daily-life style, not formal textbook
     - Consistent: same terminology across the whole video
-    - Emotion-preserving: keeps the emotional tone of the original
     """
     import requests
 
     lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
     use_roman = target_lang in ROMAN_LANGS
-    use_kokoro_native = target_lang in KOKORO_NATIVE_LANGS
 
-    # For Hindi: generate Devanagari (for Kokoro TTS) — this produces much better
-    # quality than romanized text because Kokoro's Hindi model is trained on Devanagari
-    # For Edge-TTS (fallback), we romanize the Devanagari text using Google's API
-    if use_kokoro_native:
-        # Use native script (Devanagari for Hindi, etc.)
-        lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
-    elif use_roman:
-        lang_name = LANG_ROMAN_NAMES.get(target_lang, LANG_FULL_NAMES.get(target_lang, target_lang))
-    else:
-        lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
-
-    # Build system prompt — professional dubbing translator
-    if use_kokoro_native:
+    # Build system prompt
+    if use_roman:
         system = (
-            f"You are an expert dubbing translator for professional video content. "
-            f"Translate the dialogue to {lang_name}. "
-            "CRITICAL RULES:\n"
-            "1. Keep it natural and conversational — like how people actually talk in daily life\n"
-            "2. Preserve the original emotion, tone, and intensity\n"
-            "3. Keep proper nouns (names, places, brands) as-is in their original script\n"
-            "4. Match the register (formal→formal, casual→casual)\n"
-            "5. Adapt idioms to natural equivalents, don't translate literally\n"
-            "6. Keep the translation concise — it must fit the same time slot as the original\n"
-            "7. Maintain natural sentence flow for voice-over\n"
-            "8. Write in the NATIVE SCRIPT of the target language (e.g., Devanagari for Hindi)\n\n"
-            "Only output the translations, one per line, prefixed with the segment number. "
-            "Format: '1. <translation>'"
-        )
-    elif use_roman:
-        system = (
-            f"You are an expert dubbing translator for professional video content. "
-            f"Translate the dialogue to {lang_name}. "
-            "CRITICAL RULES:\n"
-            "1. Keep it natural and conversational — like how people actually talk in daily life\n"
-            "2. Preserve the original emotion, tone, and intensity\n"
-            "3. Keep proper nouns (names, places, brands) as-is\n"
-            "4. Match the register (formal→formal, casual→casual)\n"
-            "5. Adapt idioms to natural equivalents, don't translate literally\n"
-            "6. Keep the translation concise — it must fit the same time slot as the original\n"
-            "7. Maintain natural sentence flow for voice-over\n\n"
+            f"You are a professional dubbing translator. Translate the dialogue to {lang_name}. "
+            "Keep it natural and conversational — like how people actually talk in daily life. "
+            "Preserve the tone and emotion of the original. "
+            "Keep proper nouns (names, places, brands) as-is. "
             "Only output the translations, one per line, prefixed with the segment number. "
             "Format: '1. <translation>'"
         )
     else:
         system = (
-            f"You are an expert dubbing translator for professional video content. "
-            f"Translate the dialogue to {lang_name}. "
-            "CRITICAL RULES:\n"
-            "1. Keep it natural and conversational\n"
-            "2. Preserve the original emotion, tone, and intensity\n"
-            "3. Keep proper nouns (names, places, brands) as-is\n"
-            "4. Match the register (formal→formal, casual→casual)\n"
-            "5. Adapt idioms to natural equivalents, don't translate literally\n"
-            "6. Keep the translation concise — it must fit the same time slot as the original\n"
-            "7. Maintain natural sentence flow for voice-over\n\n"
+            f"You are a professional dubbing translator. Translate the dialogue to {lang_name}. "
+            "Keep it natural and conversational. Preserve the tone and emotion. "
+            "Keep proper nouns (names, places, brands) as-is. "
             "Only output the translations, one per line, prefixed with the segment number. "
             "Format: '1. <translation>'"
         )
@@ -1136,11 +969,8 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
     to translation_checkpoint.json so it can resume if internet drops.
     progress_callback(done, total, preview) called per segment."""
     use_roman = target_lang in ROMAN_LANGS
-    use_kokoro_native = target_lang in KOKORO_NATIVE_LANGS
     lang_label = LANG_NAMES.get(target_lang, target_lang)
-    if use_kokoro_native:
-        lang_label += " (Native)"
-    elif use_roman:
+    if use_roman:
         lang_label += " (Roman)"
     print(f"  [3/5] Translating to '{lang_label}'...")
 
@@ -1206,14 +1036,12 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
     # --- Fallback: Google Translate for any remaining untranslated ---
     remaining = [i for i, t in enumerate(translated) if t is None]
     if remaining:
-        if use_kokoro_native:
-            print(f"        Translating {len(remaining)} segments with Google (Native script)...")
-        elif use_roman:
+        if use_roman:
             print(f"        Translating {len(remaining)} segments with Google (Roman)...")
         else:
             print(f"        Translating {len(remaining)} segments with Google Translate...")
         
-        if not use_roman or use_kokoro_native:
+        if not use_roman:
             from deep_translator import GoogleTranslator
             translator = GoogleTranslator(source="auto", target=target_lang)
 
@@ -1222,20 +1050,7 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             max_retries = 5
             translated_text = None
 
-            if use_kokoro_native:
-                # Use Google Translate with native script (Devanagari for Hindi)
-                for attempt in range(max_retries):
-                    try:
-                        translated_text = translator.translate(seg["text"])
-                        break
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            wait_time = (attempt + 1) * 5
-                            print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
-                            time.sleep(wait_time)
-                        else:
-                            print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
-            elif use_roman:
+            if use_roman:
                 # Romanized translation via Google's unofficial API
                 for attempt in range(max_retries):
                     try:
@@ -1967,18 +1782,8 @@ async def generate_tts_segments(segments: list, target_lang: str,
 
     # Determine voice mode
     multi_speaker = speaker_voices and any("speaker" in s for s in segments)
-    # Check if Kokoro is available for this language
-    _kokoro_active = False
-    try:
-        import kokoro_tts
-        _kokoro_active = kokoro_tts.is_supported(target_lang)
-    except ImportError:
-        pass
-
     if use_voice_cloning:
         mode_str = "voice cloning (original speaker voice)"
-    elif _kokoro_active:
-        mode_str = "Kokoro TTS (SOTA quality)"
     else:
         mode_str = "Edge-TTS"
     if multi_speaker:
@@ -2085,50 +1890,19 @@ async def generate_tts_segments(segments: list, target_lang: str,
                                edge_voice=seg_voice)
 
     async def synth_one(idx: int, text: str, out_path: str, seg_voice: str,
-                       ref_path: str = None, target_duration: float = None,
-                       use_kokoro: bool = True):
-        """Main synthesis dispatcher: Kokoro TTS → voice cloning → edge-tts.
-        
-        Priority order (non-voice-cloning mode):
-          1. Kokoro TTS — SOTA quality, 82M params, 10+ languages
-          2. Edge-TTS — Microsoft's free TTS, 100+ languages (fallback)
-        
-        Priority order (voice-cloning mode):
-          1. Voice cloning (Chatterbox → IndexTTS → OpenVoice → XTTS)
-          2. Kokoro TTS — if voice cloning fails
-          3. Edge-TTS — final fallback
-        """
+                       ref_path: str = None, target_duration: float = None):
+        """Main synthesis dispatcher: voice cloning or edge-tts."""
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return
-
-        # Calculate speed for timing alignment
-        kokoro_speed = 1.0
-        if target_duration and target_duration > 0.5:
-            # We'll use Kokoro's native speed control for better quality
-            # than post-processing atempo. Speed > 1.0 = faster.
-            # First generate at normal speed to measure, then adjust.
-            pass  # Speed adjustment happens inside Kokoro synth
-
-        # --- Voice cloning mode ---
         if use_voice_cloning and ref_path:
+            # Run voice cloning in a thread (it's synchronous)
             loop = asyncio.get_event_loop()
             success = await loop.run_in_executor(
                 None, synth_one_clone, idx, text, out_path, ref_path, seg_voice)
             if success:
                 return
-            print(f"        ⚠ Voice clone failed for clip {idx}, trying Kokoro/edge-tts")
-
-        # --- Kokoro TTS (primary, high quality) ---
-        if use_kokoro and not use_voice_cloning:
-            try:
-                kokoro_ok = await loop_run_kokoro(
-                    text, out_path, target_lang, seg_voice, target_duration)
-                if kokoro_ok:
-                    return
-            except Exception as e:
-                print(f"        ⚠ Kokoro TTS failed for clip {idx}: {e!r}")
-
-        # --- Edge-TTS (fallback) ---
+            # Fallback to edge-tts
+            print(f"        ⚠ Voice clone failed for clip {idx}, falling back to edge-tts")
         await synth_one_edge(idx, text, out_path, seg_voice, target_duration)
 
     # Create all tasks
@@ -2151,74 +1925,15 @@ async def generate_tts_segments(segments: list, target_lang: str,
     # Progress tracking with a counter
     done_count = [existing]
     progress_lock = asyncio.Lock()
-
-    # Kokoro TTS integration
-    _kokoro_available = False
-    try:
-        import kokoro_tts
-        _kokoro_available = kokoro_tts.is_supported(target_lang)
-        if _kokoro_available:
-            print(f"        ✓ Kokoro TTS available for '{target_lang}' — will use as primary TTS engine")
-    except ImportError:
-        pass
-
-    async def loop_run_kokoro(text: str, out_path: str, lang: str,
-                               edge_voice: str, target_duration: float = None) -> bool:
-        """Run Kokoro TTS in a thread (it's synchronous)."""
-        if not _kokoro_available:
-            return False
-        loop = asyncio.get_event_loop()
-
-        # Determine Kokoro voice
-        # For multi-speaker, map edge voice to kokoro voice
-        kokoro_voice = None
-        if multi_speaker:
-            # Get speaker ID from segment and map to Kokoro voice
-            spk = None
-            for s in segments:
-                if s.get("translated") == text:
-                    spk = s.get("speaker", 0)
-                    break
-            if spk is not None:
-                kokoro_voice = kokoro_tts.get_voice_for_speaker(
-                    spk, len(speaker_voices or {}), lang)
-        else:
-            kokoro_voice = kokoro_tts.get_default_voice(lang)
-
-        # Calculate speed for timing alignment
-        speed = 1.0
-        if target_duration and target_duration > 0.5:
-            # First generate at normal speed to measure
-            def _gen_probe():
-                return kokoro_tts.generate_speech(
-                    text, out_path + ".probe", lang, kokoro_voice, speed=1.0)
-            probe_ok = await loop.run_in_executor(None, _gen_probe)
-            if probe_ok:
-                probe_dur = get_audio_duration(out_path + ".probe")
-                try:
-                    os.remove(out_path + ".probe")
-                except OSError:
-                    pass
-                if probe_dur > 0:
-                    ratio = probe_dur / target_duration
-                    # Clamp to 0.7x-1.5x
-                    speed = max(0.7, min(1.5, ratio))
-
-        def _gen():
-            return kokoro_tts.generate_speech(
-                text, out_path, lang, kokoro_voice, speed=speed)
-        return await loop.run_in_executor(None, _gen)
-
     # Voice cloning concurrency:
-    #   - Kokoro and local XTTS share one loaded model — force serial (1).
+    #   - Local XTTS shares one loaded model — running >1 inference at once
+    #     would spike RAM and OOM on small VMs, so force serial (1).
     #   - HF-space fallback can handle a little parallelism (2).
     # Edge-TTS is light and can run 8 in parallel.
     if use_voice_cloning:
         sem_concurrency = 2 if _local_xtts_failed else 1
-    elif _kokoro_available:
-        sem_concurrency = 1  # Kokoro uses one loaded model, serial
     else:
-        sem_concurrency = 8  # Edge-TTS can parallelize
+        sem_concurrency = 8
     sem = asyncio.Semaphore(sem_concurrency)
 
     async def run_with_progress(idx, task):
@@ -2231,8 +1946,7 @@ async def generate_tts_segments(segments: list, target_lang: str,
 
     tasks_list = [run_with_progress(i, synth_one(i, seg["translated"], ts["audio_path"], ts["voice"],
                                                    get_ref_audio_for_seg(seg),
-                                                   target_duration=(seg["end"] - seg["start"]),
-                                                   use_kokoro=_kokoro_available))
+                                                   target_duration=(seg["end"] - seg["start"])))
              for i, (seg, ts) in enumerate(zip(segments, tts_segments))]
 
     await asyncio.gather(*tasks_list)
@@ -2593,29 +2307,20 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
         raise RuntimeError("Audio mixing produced empty output")
 
     # Apply professional audio processing to the voice track:
-    # This chain mimics professional dubbing studio processing:
     # 1. High-pass filter (remove rumble below 80Hz)
-    # 2. Low-pass filter (remove harsh highs above 15kHz)
-    # 3. Noise gate (silence background between words)
-    # 4. De-essing (reduce harsh sibilance around 6-8kHz)
-    # 5. Gentle compression (even out volume, -18dB threshold, 3:1 ratio)
-    # 6. EQ: warmth (200Hz), presence (3kHz), air (10kHz)
-    # 7. Subtle room reverb (makes TTS sound like it's in a room, more natural)
-    # 8. Soft limiter to prevent clipping
+    # 2. De-essing (reduce harsh sibilance around 6-8kHz)
+    # 3. Gentle compression (even out volume, -18dB threshold, 3:1 ratio)
+    # 4. Subtle EQ boost for presence (2-4kHz) and warmth (200Hz)
+    # 5. Soft limiter to prevent clipping
     processed_voice = os.path.join(temp_dir, "voice_processed.wav")
     voice_filter = (
-        "highpass=f=80,"                                                # remove sub-bass rumble
-        "lowpass=f=15000,"                                              # remove harsh highs
-        "agate=threshold=-35dB:range=0.01:attack=5:release=200,"       # noise gate between words
+        "highpass=f=80,"                                    # remove sub-bass rumble
+        "lowpass=f=15000,"                                  # remove harsh highs
         "acompressor=threshold=-18dB:ratio=3:1:attack=5:release=80:makeup=2,"  # gentle compression
-        "equalizer=f=200:width_type=q:w=1:g=2,"                        # warmth
-        "equalizer=f=3000:width_type=q:w=1.5:g=3,"                     # presence/clarity
-        "equalizer=f=7000:width_type=q:w=2:g=-3,"                      # de-ess
-        "equalizer=f=10000:width_type=q:w=2:g=1,"                      # air (subtle high boost)
-        # Subtle reverb for natural room sound (makes TTS less "dead")
-        # Very short decay (0.3s) and low wet mix (15%) — just adds presence
-        "aecho=in_gain=1:out_gain=0.85:delays=20:decays=0.1,"           # subtle room feel
-        "alimiter=limit=0.95"                                          # prevent clipping
+        "equalizer=f=200:width_type=q:w=1:g=2,"            # warmth
+        "equalizer=f=3000:width_type=q:w=1.5:g=3,"         # presence/clarity
+        "equalizer=f=7000:width_type=q:w=2:g=-3,"           # de-ess
+        "alimiter=limit=0.95"                               # prevent clipping
     )
     proc_cmd = ["ffmpeg", "-y", "-i", mixed_path,
                 "-af", voice_filter,
@@ -3039,7 +2744,7 @@ def dub_video(
     speaker_voices: dict = None,
     use_voice_cloning: bool = False,
     extend_video: bool = True,
-    keep_background_music: bool = True,
+    keep_background_music: bool = False,
 ) -> dict:
     """
     Main function to dub a video.
@@ -3214,42 +2919,12 @@ def dub_video(
 
                 if speaker_voices is None:
                     speaker_voices = {}
-                    # --- Intelligent Voice Detection ---
-                    # Analyze each speaker's audio to detect gender/age
-                    # and assign the best matching TTS voice
-                    try:
-                        import voice_manager
-                        log(2, f"  [2.6] Analyzing speaker voices (gender/age detection)...", 0, len(detected_speakers))
-                        
-                        def vm_progress(done, total, msg):
-                            log(2, f"        {msg}", done, total)
-                        
-                        # We need reference audio for each speaker
-                        # Extract short clips from the original audio for analysis
-                        speaker_analysis = {}
-                        if not multi_speaker and use_voice_cloning:
-                            # Single speaker — use the whole audio
-                            pass  # Will extract during stage 3.5
-                        
-                        # For now, use voice_manager to analyze reference audio
-                        # The actual reference extraction happens at stage 3.5
-                        # Here we just assign based on pool order (fallback)
-                        # Voice_manager analysis happens at stage 3.5
-                        for spk_id in detected_speakers:
-                            speaker_voices[spk_id] = get_voice_for_speaker(
-                                spk_id, num_detected, target_lang)
-                        
-                        log(2, f"Voice assignments (will be refined after voice analysis):", num_detected, num_detected)
-                        for spk_id in detected_speakers:
-                            log(2, f"  Speaker {spk_id} → {speaker_voices[spk_id]}")
-                    except ImportError:
-                        # voice_manager not available — use simple pool assignment
-                        for spk_id in detected_speakers:
-                            speaker_voices[spk_id] = get_voice_for_speaker(
-                                spk_id, num_detected, target_lang)
-                        log(2, f"Voice assignments:", num_detected, num_detected)
-                        for spk_id in detected_speakers:
-                            log(2, f"  Speaker {spk_id} → {speaker_voices[spk_id]}")
+                    for spk_id in detected_speakers:
+                        speaker_voices[spk_id] = get_voice_for_speaker(
+                            spk_id, num_detected, target_lang)
+                    log(2, f"Voice assignments:", num_detected, num_detected)
+                    for spk_id in detected_speakers:
+                        log(2, f"  Speaker {spk_id} → {speaker_voices[spk_id]}")
 
             log(2, f"Transcribed {len(segments)} segments (language: {source_lang})",
                 total_duration, total_duration)
@@ -3330,49 +3005,6 @@ def dub_video(
             )
             if speaker_ref_audios:
                 log(3, f"Extracted {len(speaker_ref_audios)} reference voice clips", 1, 1)
-                
-                # --- Intelligent Voice Analysis ---
-                # Analyze each speaker's reference audio to detect gender/age
-                # and refine the voice assignments
-                try:
-                    import voice_manager
-                    log(3, f"  [3.6] Analyzing speaker characteristics (AI gender/age detection)...", 0, len(speaker_ref_audios))
-                    
-                    def analyze_progress(done, total, msg):
-                        log(3, msg, done, total)
-                    
-                    speaker_profiles = voice_manager.analyze_all_speakers(
-                        speaker_ref_audios, progress_callback=analyze_progress)
-                    
-                    # Refine voice assignments based on detected gender/age
-                    if multi_speaker:
-                        log(3, f"  Refining voice assignments based on speaker analysis:", 0, len(speaker_profiles))
-                        for spk_id, profile in speaker_profiles.items():
-                            gender = profile["gender"]
-                            age = profile["age"]
-                            
-                            # Get gender-appropriate voice
-                            if target_lang == "hi":
-                                # For Hindi, prefer Edge-TTS gender-appropriate voices
-                                new_voice = voice_manager.get_voice_by_profile(
-                                    gender, age, target_lang, speaker_index=spk_id)
-                            else:
-                                new_voice = voice_manager.get_voice_by_profile(
-                                    gender, age, target_lang, speaker_index=spk_id)
-                            
-                            old_voice = speaker_voices.get(spk_id, "unknown")
-                            speaker_voices[spk_id] = new_voice
-                            log(3, f"    Speaker {spk_id}: {profile['description']} → {new_voice}", spk_id, len(speaker_profiles))
-                    
-                    # Store profiles for later use
-                    for spk_id, profile in speaker_profiles.items():
-                        print(f"        🎭 {profile['description']}")
-                        
-                except ImportError:
-                    print("        ⚠ voice_manager not available, using default voice assignment")
-                except Exception as e:
-                    print(f"        ⚠ Voice analysis failed: {e!r}")
-                    
             else:
                 log(3, f"⚠ Failed to extract reference audio, will use edge-tts fallback", 1, 1)
                 use_voice_cloning = False
