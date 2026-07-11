@@ -162,8 +162,15 @@ def auto_resume_jobs():
             "num_speakers": ckpt.get("num_speakers"),
             "voice_clone": saved.get("voice_clone", False) if saved else False,
             "extend_video": saved.get("extend_video", True) if saved else True,
+            "emotion_transfer": saved.get("emotion_transfer", True) if saved else True,
+            "prosody_strength": saved.get("prosody_strength", 1.0) if saved else 1.0,
+            "anti_copyright": saved.get("anti_copyright", False) if saved else False,
+            "blur_original_subtitles": saved.get("blur_original_subtitles", False) if saved else False,
+            "subtitle_lang": saved.get("subtitle_lang", None) if saved else None,
+            "funny_mode": saved.get("funny_mode", False) if saved else False,
             "output_video": None,
             "srt_file": None,
+            "subtitle_srt_file": None,
             "segments_count": 0,
             "elapsed_seconds": 0,
             "logs": [],
@@ -562,6 +569,47 @@ HTML_TEMPLATE = r"""
             </select>
         </div>
 
+        <!-- Subtitle Language (separate from dub language) -->
+        <div class="form-group">
+            <label>📝 Subtitle Language <span class="hint">(burn subtitles in this language; leave blank = same as dub)</span></label>
+            <select id="subtitleLang">
+                <option value="">— Same as dub language —</option>
+                <option value="en">🇬🇧/🇺🇸 English</option>
+                <option value="hi">🇮🇳 Hindi (हिन्दी)</option>
+                <option value="es">🇪🇸 Spanish (Español)</option>
+                <option value="fr">🇫🇷 French (Français)</option>
+                <option value="de">🇩🇪 German (Deutsch)</option>
+                <option value="it">🇮🇹 Italian (Italiano)</option>
+                <option value="pt">🇧🇷 Portuguese (Português)</option>
+                <option value="ru">🇷🇺 Russian (Русский)</option>
+                <option value="ja">🇯🇵 Japanese (日本語)</option>
+                <option value="ko">🇰🇷 Korean (한국어)</option>
+                <option value="zh">🇨🇳 Chinese (中文)</option>
+                <option value="ar">🇸🇦 Arabic (العربية)</option>
+                <option value="tr">🇹🇷 Turkish (Türkçe)</option>
+                <option value="id">🇮🇩 Indonesian (Bahasa Indonesia)</option>
+                <option value="bn">🇧🇩 Bengali (বাংলা)</option>
+                <option value="ta">🇮🇳 Tamil (தமிழ்)</option>
+                <option value="te">🇮🇳 Telugu (తెలుగు)</option>
+                <option value="ur">🇵🇰 Urdu (اردو)</option>
+                <option value="mr">🇮🇳 Marathi (मराठी)</option>
+                <option value="gu">🇮🇳 Gujarati (ગુજરાતી)</option>
+                <option value="kn">🇮🇳 Kannada (ಕನ್ನಡ)</option>
+                <option value="ml">🇮🇳 Malayalam (മലയാളം)</option>
+                <option value="pa">🇮🇳 Punjabi (ਪੰਜਾਬੀ)</option>
+                <option value="th">🇹🇭 Thai (ภาษาไทย)</option>
+                <option value="vi">🇻🇳 Vietnamese (Tiếng Việt)</option>
+                <option value="pl">🇵🇱 Polish (Polski)</option>
+                <option value="nl">🇳🇱 Dutch (Nederlands)</option>
+                <option value="sv">🇸🇪 Swedish (Svenska)</option>
+                <option value="fa">🇮🇷 Persian (فارسی)</option>
+                <option value="he">🇮🇱 Hebrew (עברית)</option>
+                <option value="uk">🇺🇦 Ukrainian (Українська)</option>
+                <option value="ms">🇲🇾 Malay (Bahasa Melayu)</option>
+                <option value="fil">🇵🇭 Filipino (Filipino)</option>
+            </select>
+        </div>
+
         <!-- Voice -->
         <div class="form-group">
             <label>🔊 Voice <span class="hint">(auto-selected, or choose specific)</span></label>
@@ -644,11 +692,81 @@ HTML_TEMPLATE = r"""
                     🎵 Preserve background audio (music, sound effects, ambient sounds)
                 </label>
             </div>
-            <div style="font-size: 12px; opacity: 0.6; margin-top: 6px;">
+
+            <div style="margin-top: 14px; padding: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                    <input type="checkbox" id="emotionTransfer" checked style="width: 18px; height: 18px; accent-color: var(--accent);">
+                    <span style="font-weight: 700;">🎭 Emotion & Prosody Transfer</span>
+                    <span class="hint" style="margin-left: auto;">Artist-level dubbing</span>
+                </label>
+                <div style="font-size: 12px; opacity: 0.7; margin-bottom: 12px; line-height: 1.5;">
+                    Analyzes each segment's emotion (happy, sad, angry, surprised, etc.) using AI,
+                    then transfers the original speaker's pitch, energy, and speaking rate to the
+                    dubbed voice — making it sound like a professional voice artist.
+                    <b>Impossible to tell it was dubbed.</b>
+                </div>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <label style="font-size: 0.85em; white-space: nowrap; margin: 0;">Transfer strength:</label>
+                    <input type="range" id="prosodyStrength" min="0" max="100" value="100"
+                           style="flex: 1; accent-color: var(--accent);"
+                           oninput="document.getElementById('prosodyLabel').textContent = this.value + '%'">
+                    <span id="prosodyLabel" style="font-size: 0.85em; min-width: 40px; text-align: right;">100%</span>
+                </div>
+            </div>
+
+            <div style="margin-top: 14px; padding: 14px; background: rgba(76, 175, 80, 0.06); border: 1px solid rgba(76, 175, 80, 0.3); border-radius: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                    <input type="checkbox" id="antiCopyright" style="width: 18px; height: 18px; accent-color: #4CAF50;">
+                    <span style="font-weight: 700;">🔒 Anti-Copyright Mode</span>
+                    <span class="hint" style="margin-left: auto; color: #4CAF50;">YouTube-safe</span>
+                </label>
+                <div style="font-size: 12px; opacity: 0.8; line-height: 1.5;">
+                    Applies subtle visual + audio transformations that defeat YouTube Content ID
+                    fingerprinting — your dubbed video won't get copyright-striked by the original
+                    rights holder. <b>Viewers won't notice any difference.</b>
+                    <br><span style="opacity: 0.6; font-size: 11px; margin-top: 4px; display: block;">
+                    ✓ Mirror flip &nbsp; ✓ Slight zoom &nbsp; ✓ Color grade shift &nbsp; ✓ Audio pitch nudge &nbsp; ✓ Sharpening
+                    </span>
+                </div>
+            </div>
+
+            <div style="margin-top: 10px; padding: 14px; background: rgba(255, 152, 0, 0.06); border: 1px solid rgba(255, 152, 0, 0.3); border-radius: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                    <input type="checkbox" id="blurOriginalSubs" style="width: 18px; height: 18px; accent-color: #FF9800;">
+                    <span style="font-weight: 700;">🙈 Blur Original Subtitles</span>
+                    <span class="hint" style="margin-left: auto; color: #FF9800;">Auto-detect & hide</span>
+                </label>
+                <div style="font-size: 12px; opacity: 0.8; line-height: 1.5;">
+                    Automatically detects hardcoded (burned-in) subtitles in the original video
+                    using computer vision and blurs them out — so they don't show alongside
+                    your new dubbed subtitles. <b>Works on any video with existing subtitles.</b>
+                    <br><span style="opacity: 0.6; font-size: 11px; margin-top: 4px; display: block;">
+                    ✓ AI text detection &nbsp; ✓ Bottom + top subtitle areas &nbsp; ✓ Seamless blur
+                    </span>
+                </div>
+            </div>
+
+            <div style="margin-top: 10px; padding: 14px; background: rgba(233, 30, 99, 0.06); border: 1px solid rgba(233, 30, 99, 0.3); border-radius: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                    <input type="checkbox" id="funnyMode" style="width: 18px; height: 18px; accent-color: #E91E63;">
+                    <span style="font-weight: 700;">😂 Funny/Comedy Dub Mode</span>
+                    <span class="hint" style="margin-left: auto; color: #E91E63;">Sarcastic & be-adab</span>
+                </label>
+                <div style="font-size: 12px; opacity: 0.8; line-height: 1.5;">
+                    Rewrites the translation to be <b>funny, sarcastic, and irreverent</b> instead of
+                    faithful. Serious dialogue becomes comedy, formal speech becomes casual slang,
+                    educational content gets roasted. Think parody/comedy roast dub — be-adab, funny,
+                    thori si adult humor, but not offensive. <b>Only affects the dub audio, not subtitles.</b>
+                    <br><span style="opacity: 0.6; font-size: 11px; margin-top: 4px; display: block;">
+                    ✓ Sarcastic rewriting &nbsp; ✓ Slang & be-adab style &nbsp; ✓ Comedy roast tone &nbsp; ✓ Mild adult humor
+                    </span>
+                </div>
+            </div>
                 💡 <b>Preserve Background</b>: Uses AI (Demucs) to separate speech from background music/SFX. Only the speech is dubbed, background audio is preserved with professional sidechain ducking. <b>ON by default.</b><br>
                 💡 <b>Non-Speech Sounds</b>: Automatically detects and preserves laughs, sighs, gasps, and reactions from the original audio. These are mixed back into the dubbed track at their original timestamps — making the dub feel natural.<br>
                 💡 <b>Lip Sync</b>: Each dubbed audio clip is speed-adjusted to fit the original speaker's time slot exactly. The dubbed voice starts and ends at the same moment as the original — lips match audio.<br>
                 💡 <b>Voice Cloning</b>: Uses Chatterbox Multilingual V3 (ZeroGPU) to clone each speaker's original voice and speaks the translated text in that voice — preserves speaker identity across languages.<br>
+                💡 <b>Emotion Transfer</b>: Uses emotion2vec+ (AI speech emotion recognition) to detect emotions, then passes them to IndexTTS-2/Chatterbox for emotion-aware TTS. Post-processes with pitch shifting, energy matching, and dynamic range control.<br>
                 💡 <b>Intelligent Voice Detection</b>: AI detects each speaker's gender (male/female/child) from voice pitch and assigns the best matching voice.
             </div>
         </div>
@@ -694,6 +812,7 @@ HTML_TEMPLATE = r"""
                 </div>
                 <a class="btn btn-download" id="downloadVideo" href="#">📥 Download Dubbed Video</a>
                 <a class="btn btn-download" id="downloadSrt" href="#" style="background: var(--accent); display: none;">📝 Download Subtitles (.srt)</a>
+                <a class="btn btn-download" id="downloadSubSrt" href="#" style="background: #FF9800; display: none;">📝 Download Subtitle Language .srt</a>
                 <button class="btn" id="cleanupBtn" style="display: block; margin-top: 15px; background: #2c3e50; color: white; font-size: 14px; padding: 10px 24px; width: 100%;">🗑️ Clean Up &amp; Start New (Free Memory)</button>
             </div>
         </div>
@@ -893,6 +1012,13 @@ async function startDubbing() {
     formData.append('multi_speaker', document.getElementById('multiSpeaker').checked);
     formData.append('voice_clone', document.getElementById('voiceClone').checked);
     formData.append('extend_video', document.getElementById('extendVideo').checked);
+    formData.append('emotion_transfer', document.getElementById('emotionTransfer').checked);
+    formData.append('prosody_strength', document.getElementById('prosodyStrength').value / 100);
+    formData.append('anti_copyright', document.getElementById('antiCopyright').checked);
+    formData.append('funny_mode', document.getElementById('funnyMode').checked);
+    formData.append('blur_original_subtitles', document.getElementById('blurOriginalSubs').checked);
+    var subLangVal = document.getElementById('subtitleLang').value;
+    if (subLangVal) formData.append('subtitle_lang', subLangVal);
     var numSpeakersVal = document.getElementById('numSpeakers').value;
     if (numSpeakersVal) formData.append('num_speakers', numSpeakersVal);
 
@@ -1158,16 +1284,35 @@ function showResult(data) {
         }
     }
 
+    var emotionInfo = '';
+    if (data.emotion_summary) {
+        var es = data.emotion_summary;
+        emotionInfo = '<br><span style="color: #a29bfe;">🎭 Emotions detected:</span> '
+            + (es.dominant_emotion_display || es.dominant_emotion || 'neutral')
+            + ' (dominant)';
+        var dist = es.emotion_distribution || {};
+        var parts = [];
+        for (var emo in dist) {
+            if (dist[emo] > 0.05) parts.push(emo + ' ' + Math.round(dist[emo]*100) + '%');
+        }
+        if (parts.length > 0) emotionInfo += ' — ' + parts.join(', ');
+    }
+
     document.getElementById('resultInfo').innerHTML = `
         Source: <span>${data.source_lang}</span> → Target: <span>${data.target_lang}</span><br>
         Segments: <span>${data.segments_count}</span> | Time: <span>${data.elapsed_seconds}s</span> | Voice: <span>${data.voice}</span>
         ${speakerInfo}
+        ${emotionInfo}
     `;
 
     document.getElementById('downloadVideo').href = BASE + 'api/download/' + jobId + '/video';
     if (data.srt_file) {
         document.getElementById('downloadSrt').style.display = 'block';
         document.getElementById('downloadSrt').href = BASE + 'api/download/' + jobId + '/srt';
+    }
+    if (data.subtitle_srt_file) {
+        document.getElementById('downloadSubSrt').style.display = 'block';
+        document.getElementById('downloadSubSrt').href = BASE + 'api/download/' + jobId + '/subsrt';
     }
     // Show video preview
     var previewWrap = document.getElementById('previewWrap');
@@ -1342,6 +1487,17 @@ def api_dub():
         num_speakers = int(num_speakers_str) if num_speakers_str and num_speakers_str.isdigit() else None
         voice_clone = request.form.get("voice_clone", "false").lower() == "true"
         extend_video = request.form.get("extend_video", "true").lower() == "true"
+        emotion_transfer = request.form.get("emotion_transfer", "true").lower() == "true"
+        anti_copyright = request.form.get("anti_copyright", "false").lower() == "true"
+        blur_original_subtitles = request.form.get("blur_original_subtitles", "false").lower() == "true"
+        subtitle_lang = request.form.get("subtitle_lang", "").strip() or None
+        funny_mode = request.form.get("funny_mode", "false").lower() == "true"
+        prosody_strength_str = request.form.get("prosody_strength", "1.0")
+        try:
+            prosody_strength = float(prosody_strength_str)
+            prosody_strength = max(0.0, min(1.0, prosody_strength))
+        except (ValueError, TypeError):
+            prosody_strength = 1.0
 
         # Save uploaded file
         job_id = str(uuid.uuid4())[:8]
@@ -1359,6 +1515,7 @@ def api_dub():
             "message": "Starting...",
             "output_video": None,
             "srt_file": None,
+            "subtitle_srt_file": None,
             "source_lang": None,
             "target_lang": target_lang,
             "voice": voice,
@@ -1370,6 +1527,12 @@ def api_dub():
             "num_speakers": num_speakers,
             "voice_clone": voice_clone,
             "extend_video": extend_video,
+            "emotion_transfer": emotion_transfer,
+            "prosody_strength": prosody_strength,
+            "anti_copyright": anti_copyright,
+            "blur_original_subtitles": blur_original_subtitles,
+            "subtitle_lang": subtitle_lang,
+            "funny_mode": funny_mode,
             "segments_count": 0,
             "elapsed_seconds": 0,
             "can_resume": False,
@@ -1381,7 +1544,9 @@ def api_dub():
             target=process_job,
             args=(job_id, str(video_path), target_lang, voice,
                   model_size, keep_bg, burn_subtitles, gen_srt,
-                  False, multi_speaker, num_speakers, voice_clone, extend_video),
+                  False, multi_speaker, num_speakers, voice_clone, extend_video,
+                  emotion_transfer, prosody_strength, anti_copyright,
+                  blur_original_subtitles, subtitle_lang),
             daemon=True,
         )
         thread.start()
@@ -1407,7 +1572,10 @@ def not_found(error):
 def process_job(job_id, video_path, target_lang, voice, model_size,
                 keep_bg, burn_subtitles, gen_srt, resume=False,
                 multi_speaker=False, num_speakers=None,
-                voice_clone=False, extend_video=True):
+                voice_clone=False, extend_video=True,
+                emotion_transfer=True, prosody_strength=1.0,
+                anti_copyright=False, blur_original_subtitles=False,
+                subtitle_lang=None, funny_mode=False):
     """Background job processor."""
     import dubber
 
@@ -1433,6 +1601,8 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             "num_speakers": num_speakers,
             "voice_clone": voice_clone,
             "extend_video": extend_video,
+            "emotion_transfer": emotion_transfer,
+            "prosody_strength": prosody_strength,
         })
     except Exception:
         pass
@@ -1510,6 +1680,12 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             num_speakers=num_speakers,
             use_voice_cloning=voice_clone,
             extend_video=extend_video,
+            emotion_transfer=emotion_transfer,
+            prosody_strength=prosody_strength,
+            anti_copyright=anti_copyright,
+            blur_original_subtitles=blur_original_subtitles,
+            subtitle_lang=subtitle_lang,
+            funny_mode=funny_mode,
         )
         jobs[job_id].update({
             "status": "done",
@@ -1517,6 +1693,8 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             "message": "Done!",
             "output_video": result["output_video"],
             "srt_file": result.get("srt_file"),
+            "subtitle_srt_file": result.get("subtitle_srt_file"),
+            "subtitle_language": result.get("subtitle_language", ""),
             "source_lang": result.get("source_lang", ""),
             "voice": result.get("voice", ""),
             "segments_count": result.get("segments_count", 0),
@@ -1524,6 +1702,7 @@ def process_job(job_id, video_path, target_lang, voice, model_size,
             "multi_speaker": result.get("multi_speaker", False),
             "speakers": result.get("speakers", {}),
             "num_speakers": result.get("num_speakers", 0),
+            "emotion_summary": result.get("emotion_summary"),
         })
         save_job_status(job_id, jobs[job_id])
     except InterruptedError as e:
@@ -1693,7 +1872,13 @@ def api_resume(job_id):
         kwargs={"resume": True, "multi_speaker": multi_speaker,
                 "num_speakers": num_speakers,
                 "voice_clone": job.get("voice_clone", False),
-                "extend_video": job.get("extend_video", True)},
+                "extend_video": job.get("extend_video", True),
+                "emotion_transfer": job.get("emotion_transfer", True),
+                "prosody_strength": job.get("prosody_strength", 1.0),
+                "anti_copyright": job.get("anti_copyright", False),
+                "blur_original_subtitles": job.get("blur_original_subtitles", False),
+                "subtitle_lang": job.get("subtitle_lang", None),
+                "funny_mode": job.get("funny_mode", False)},
         daemon=True,
     )
     thread.start()
@@ -1804,6 +1989,10 @@ def api_download(job_id, ftype):
     elif ftype == "srt" and job.get("srt_file"):
         return send_file(job["srt_file"], as_attachment=True,
                          download_name=f"subtitles_{job['target_lang']}.srt")
+    elif ftype == "subsrt" and job.get("subtitle_srt_file"):
+        sub_lang = job.get("subtitle_lang", "sub")
+        return send_file(job["subtitle_srt_file"], as_attachment=True,
+                         download_name=f"subtitles_{sub_lang}.srt")
     return jsonify({"error": "File not found"}), 404
 
 
