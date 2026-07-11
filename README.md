@@ -45,6 +45,21 @@ AI-powered video dubbing — translate and dub any video into 30+ languages with
 - Each speaker's reference audio extracted from original video for authentic cloning
 - If all cloning tiers fail, gracefully falls back to synthetic voice (no crash)
 
+### 🎭 Emotion & Prosody Transfer (Artist-Level Dubbing)
+- **emotion2vec+** (speech emotion recognition foundation model) detects the emotion in each segment
+  (happy, sad, angry, surprised, afraid, disgusted, excited, worried, neutral)
+- **Prosody analysis** via librosa: pitch (F0) contour, energy (RMS), speaking rate, dynamic range
+- **Emotion-aware TTS**: passes emotion vectors to IndexTTS-2 and exaggeration/temperature to Chatterbox V3
+  so the TTS engine reproduces the same feeling as the original speaker
+- **Prosody post-processing**: after TTS generation, each clip is transformed to match the original:
+  - **Pitch matching** — shifts F0 to match the original speaker's average pitch (male→male, female→female)
+  - **Energy matching** — scales RMS to match loud/quiet segments (shouting stays loud, whispering stays quiet)
+  - **Dynamic range** — expands dynamics for emotional segments, compresses for calm ones
+  - **Emotion EQ** — adds spectral warmth per emotion (sad=darker, angry=brighter, happy=bright)
+- **Adjustable strength** — 0% to 100% transfer strength slider in the web UI
+- Result: the dubbed voice carries the same emotions, energy, and rhythm as the original — like a professional voice artist
+- **Translation prompts** include emotion preservation rules (keep ALL CAPS for shouting, ! for excited, ... for hesitation)
+
 ### 🗣️ Intelligent Voice Detection
 - AI detects each speaker's **gender (male/female/child)** from voice pitch (F0 analysis via librosa/pyin)
 - Assigns the best matching TTS voice automatically
@@ -77,6 +92,8 @@ AI-powered video dubbing — translate and dub any video into 30+ languages with
 |-----------|-----------|---------|
 | Speech-to-Text | [WhisperX](https://github.com/m-bain/whisperX) | Transcription with word-level alignment + VAD |
 | Translation | [Pollinations AI](https://pollinations.ai/) (GPT-OSS-20B) + Google Translate (fallback) | Context-aware, natural Hinglish translation |
+| Emotion Recognition | [emotion2vec+](https://github.com/ddlBoJack/emotion2vec) | Speech emotion recognition (9 emotions) |
+| Prosody Analysis | [librosa](https://librosa.org/) | Pitch (F0), energy, speaking rate extraction |
 | Text-to-Speech | [Kokoro-82M](https://github.com/hexgrad/Kokoro-82M) | SOTA TTS, 82M params, 10+ languages |
 | TTS Fallback | [edge-tts](https://github.com/rany2/edge-tts) | Microsoft Edge TTS (free, 23+ languages) |
 | Voice Cloning | Chatterbox V3 / IndexTTS-2 / XTTS-v2 / OpenVoice V2 | Multi-tier voice cloning with emotion |
@@ -270,6 +287,24 @@ When `--voice-clone` is enabled, each clip tries these backends in order:
 - Set `HF_TOKEN` env var for increased ZeroGPU quota (add token to `.hf_token` file)
 - If all cloning tiers fail for a clip, it gracefully falls back to Kokoro/edge-tts (no crash)
 - Multi-speaker: each speaker gets their own reference audio extracted from the original video
+- **Emotion-aware**: Tiers 1-2 receive emotion vectors/exaggeration from emotion2vec+ analysis
+
+### Emotion & Prosody Transfer Pipeline
+
+When `--emotion-transfer` is enabled (default), the pipeline adds two stages:
+
+1. **Stage 2.5: Emotion Analysis**
+   - Extracts each speech segment from the original audio
+   - Runs emotion2vec+ to classify emotion (9 classes: happy, sad, angry, surprised, afraid, disgusted, excited, worried, neutral)
+   - Extracts prosody via librosa: pitch (F0 via pyin), energy (RMS), speaking rate (onset detection)
+   - Maps emotion → IndexTTS-2 emotion vector + Chatterbox exaggeration/temperature
+
+2. **Stage 4.6: Prosody Transfer** (after TTS, before mixing)
+   - Pitch matching: shifts TTS output F0 to match original speaker's pitch
+   - Energy matching: scales RMS to match original segment's loudness
+   - Dynamic range: expands/compresses dynamics based on emotional intensity
+   - Emotion EQ: spectral warmth adjustment per emotion type
+   - Strength adjustable via `--prosody-strength 0.0-1.0`
 
 ### Lip Sync
 
