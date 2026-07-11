@@ -904,6 +904,11 @@ ROMAN_LANGS = {"hi", "ur"}
 # Languages where Kokoro TTS is available and needs native script
 KOKORO_NATIVE_LANGS = {"hi", "zh", "ja"}
 
+# Languages that should use Hinglish/Roman Urdu style — natural mix of Hindi+English+Urdu
+# written in Latin script, like how people actually talk in daily life
+# e.g., "Hello sabko, aaj hum AI ke baare mein baat karenge"
+HINGLISH_LANGS = {"hi", "ur"}
+
 # Language full names for LLM prompts
 LANG_FULL_NAMES = {
     "hi": "Hindi (Devanagari script — written in Hindi script like 'आप कैसे हैं?')",
@@ -949,12 +954,14 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
     lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
     use_roman = target_lang in ROMAN_LANGS
     use_kokoro_native = target_lang in KOKORO_NATIVE_LANGS
+    use_hinglish = target_lang in HINGLISH_LANGS
 
-    # For Hindi: generate Devanagari (for Kokoro TTS) — this produces much better
-    # quality than romanized text because Kokoro's Hindi model is trained on Devanagari
-    # For Edge-TTS (fallback), we romanize the Devanagari text using Google's API
-    if use_kokoro_native:
-        # Use native script (Devanagari for Hindi, etc.)
+    # For Hindi/Urdu: generate HINGLISH (natural mix of Hindi+English+Urdu in Latin script)
+    # This is how people actually talk — not formal shuddh Hindi/Urdu
+    # Kokoro TTS handles Hinglish well (tested), Edge-TTS needs Devanagari fallback
+    if use_hinglish:
+        lang_name = "Hinglish (natural Hindi-English-Urdu mix in Roman/Latin script, like daily conversation)"
+    elif use_kokoro_native:
         lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
     elif use_roman:
         lang_name = LANG_ROMAN_NAMES.get(target_lang, LANG_FULL_NAMES.get(target_lang, target_lang))
@@ -962,7 +969,42 @@ def llm_translate_batch(segments: list, target_lang: str, source_lang: str = Non
         lang_name = LANG_FULL_NAMES.get(target_lang, target_lang)
 
     # Build system prompt — professional dubbing translator
-    if use_kokoro_native:
+    if use_hinglish:
+        system = (
+            f"You are an expert dubbing translator for professional video content. "
+            f"Translate the dialogue to {lang_name}. "
+            "CRITICAL RULES:\n"
+            "1. Write in HINGLISH — natural mix of Hindi + English + Urdu in Roman/Latin script\n"
+            "   This is how Indian/South Asian people ACTUALLY talk in daily life\n"
+            "   NOT formal shuddh Hindi, NOT pure Devanagari — natural conversational Hinglish\n"
+            "2. Keep common English words AS-IS (hello, welcome, thank you, please, sorry, okay,\n"
+            "   actually, basically, literally, guys, super, amazing, etc.) — don't translate them\n"
+            "3. Keep ALL technical/modern terms in English (AI, video, internet, app, data,\n"
+            "   neural, network, computer, phone, online, digital, etc.) — don't translate them\n"
+            "4. Translate ENGLISH SENTENCE STRUCTURE to Hindi/Urdu structure\n"
+            "   'We will explore how AI is changing the world' → 'Hum explore karenge AI kaise duniya badal raha hai'\n"
+            "   'I cannot believe this is possible' → 'Mujhe believe nahi ho raha yeh possible hai'\n"
+            "   Don't leave whole English phrases untranslated — mix naturally like code-switching\n"
+            "5. Keep proper nouns (names, places, brands, channels) as-is\n"
+            "6. Use Roman script ONLY — no Devanagari, no Urdu script\n"
+            "   Example: 'नमस्ते' → 'Namaste', 'आज' → 'aaj', 'क्या' → 'kya'\n"
+            "7. Preserve the original emotion, tone, and intensity\n"
+            "8. Match the register (formal→formal, casual→casual)\n"
+            "9. Adapt idioms to natural Hinglish equivalents, don't translate literally\n"
+            "10. Keep the translation concise — it must fit the same time slot as the original\n"
+            "11. Maintain natural sentence flow for voice-over\n\n"
+            "EXAMPLES of good Hinglish translation:\n"
+            "  'Hello everyone, welcome to this video' → 'Hello sabko, is video mein welcome hai'\n"
+            "  'Today we will learn about AI' → 'Aaj hum AI ke baare mein seekhenge'\n"
+            "  'This is amazing, right?' → 'Yeh amazing hai na?'\n"
+            "  'Let me show you something' → 'Main dikhata hoon kuch interesting'\n"
+            "  'What do you think?' → 'Tumko kya lagta hai?'\n"
+            "  'We will explore how AI is changing the world' → 'Hum explore karenge AI kaise duniya badal raha hai'\n"
+            "  'I cannot believe this is possible' → 'Mujhe believe nahi ho raha yeh possible hai'\n\n"
+            "Only output the translations, one per line, prefixed with the segment number. "
+            "Format: '1. <translation>'"
+        )
+    elif use_kokoro_native:
         system = (
             f"You are an expert dubbing translator for professional video content. "
             f"Translate the dialogue to {lang_name}. "
@@ -1144,8 +1186,11 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
     progress_callback(done, total, preview) called per segment."""
     use_roman = target_lang in ROMAN_LANGS
     use_kokoro_native = target_lang in KOKORO_NATIVE_LANGS
+    use_hinglish = target_lang in HINGLISH_LANGS
     lang_label = LANG_NAMES.get(target_lang, target_lang)
-    if use_kokoro_native:
+    if use_hinglish:
+        lang_label += " (Hinglish)"
+    elif use_kokoro_native:
         lang_label += " (Native)"
     elif use_roman:
         lang_label += " (Roman)"
@@ -1213,7 +1258,9 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
     # --- Fallback: Google Translate for any remaining untranslated ---
     remaining = [i for i, t in enumerate(translated) if t is None]
     if remaining:
-        if use_kokoro_native:
+        if use_hinglish:
+            print(f"        Translating {len(remaining)} segments with Google (Hinglish/Roman)...")
+        elif use_kokoro_native:
             print(f"        Translating {len(remaining)} segments with Google (Native script)...")
         elif use_roman:
             print(f"        Translating {len(remaining)} segments with Google (Roman)...")
@@ -1229,7 +1276,25 @@ def translate_segments(segments: list, target_lang: str, source_lang: str = None
             max_retries = 5
             translated_text = None
 
-            if use_kokoro_native:
+            if use_hinglish:
+                # Hinglish: use Google's romanized API for natural Roman Hindi/Urdu
+                for attempt in range(max_retries):
+                    try:
+                        native_text, roman_text = google_translate_romanized(
+                            seg["text"], target_lang, source_lang or "auto"
+                        )
+                        # Prefer roman text (natural daily style); fallback to native
+                        translated_text = roman_text if roman_text else native_text
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 5
+                            print(f"        Translation retry {attempt + 1}/{max_retries} for segment {i} (waiting {wait_time}s): {e}")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"        Warning: translation failed for segment {i} after {max_retries} retries: {e}")
+                            translated_text = seg["text"]  # fallback to original
+            elif use_kokoro_native:
                 # Use Google Translate with native script (Devanagari for Hindi)
                 for attempt in range(max_retries):
                     try:
