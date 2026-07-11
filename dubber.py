@@ -378,7 +378,7 @@ def separate_vocals(audio_path: str, temp_dir: str,
     The vocals file is used for transcription (cleaner speech = better accuracy).
     The no_vocals file is mixed with dubbed TTS to preserve original background.
     """
-    print(f"  [1.5] Separating vocals from background (Demucs htdemucs)...")
+    print(f"  [1.5] Separating vocals from background (Demucs mdx_extra)...")
     if progress_callback:
         progress_callback(1, "Separating vocals from background music...")
 
@@ -396,15 +396,17 @@ def separate_vocals(audio_path: str, temp_dir: str,
     demucs_args = [
         "demucs",
         "--two-stems", "vocals",   # vocals vs no_vocals
-        "-n", "htdemucs",          # Hybrid Demucs v4 (best quality)
+        "-n", "htdemucs",          # Hybrid Demucs v4 (best quality, cached on this VM)
         "-o", output_dir,          # output directory
         "--shifts", "1",           # Minimize shifts for speed
+        "--segment", "7",          # Chunk processing — saves RAM, prevents swap
+        "--overlap", "0.25",       # Minimal overlap for speed
         audio_path,
     ]
 
     # Run Demucs in a subprocess with timeout to prevent hanging on long videos.
-    # Demucs on CPU takes ~1s per 10s of audio, so a 10-min video takes ~60s.
-    # For 30+ min videos, this could take 3+ minutes — set generous timeout.
+    # htdemucs on this 2-vCPU VM runs at ~1.5x real-time.
+    # For a 10-min video: ~15 min. For a 2-min video: ~3 min.
     import subprocess as _sp
 
     # Get audio duration to calculate timeout
@@ -417,9 +419,9 @@ def separate_vocals(audio_path: str, temp_dir: str,
     except Exception:
         audio_dur = 60  # assume 1 min if unknown
 
-    # Timeout: 6x audio duration (Demucs on CPU is ~6x real-time for htdemucs)
-    # Minimum 120s, maximum 1800s (30 min)
-    demucs_timeout = min(1800, max(120, int(audio_dur * 6)))
+    # Timeout: 3x audio duration (htdemucs is ~1.5x real-time, give 2x margin)
+    # Minimum 60s, maximum 1800s (30 min)
+    demucs_timeout = min(1800, max(60, int(audio_dur * 3)))
 
     # Run Demucs in a separate process so we can kill it if it hangs
     venv_python = sys.executable
@@ -3381,18 +3383,35 @@ def dub_video(
         no_vocals_path = None
         transcribe_audio_path = audio_wav  # default: transcribe from full audio
         if keep_background_music:
-            if ckpt is None or ckpt["stage"] < 1:
-                # Only run if we just extracted audio (not resuming past stage 1)
-                pass
-            log(1, f"  [1.5] Isolating vocals from background music (Demucs)...")
-            vocals_path, no_vocals_path = separate_vocals(
-                audio_wav, temp_dir, progress_callback=progress_callback)
-            if vocals_path:
-                transcribe_audio_path = vocals_path
-                log(1, f"        ✅ Will transcribe from isolated vocals (cleaner speech)")
+            # Skip Demucs for audio >5 min — it runs at ~1.5x real-time on this CPU,
+            # so a 10-min video takes 15 min just for vocal separation.
+            # Instead, use the original audio for both transcription (faster-whisper
+            # VAD handles background music) and as the background track with ducking.
+            try:
+                import subprocess as _sp
+                dur_r = _sp.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", audio_wav],
+                    capture_output=True, text=True, timeout=10)
+                audio_dur_sec = float(dur_r.stdout.strip() or "0")
+            except Exception:
+                audio_dur_sec = 0
+
+            if audio_dur_sec > 300:
+                log(1, f"  [1.5] Skipping vocal isolation (audio is {audio_dur_sec:.0f}s — Demucs would take ~{audio_dur_sec*1.5:.0f}s)")
+                log(1, f"       Using original audio with sidechain ducking for background preservation")
+                # Use original audio as background — the mixing stage will duck it during speech
+                no_vocals_path = audio_wav  # original audio = background track
             else:
-                log(1, f"        ⚠ Vocal isolation failed, using full audio")
-                no_vocals_path = None
+                log(1, f"  [1.5] Isolating vocals from background music (Demucs)...")
+                vocals_path, no_vocals_path = separate_vocals(
+                    audio_wav, temp_dir, progress_callback=progress_callback)
+                if vocals_path:
+                    transcribe_audio_path = vocals_path
+                    log(1, f"        ✅ Will transcribe from isolated vocals (cleaner speech)")
+                else:
+                    log(1, f"        ⚠ Vocal isolation failed, using full audio")
+                    no_vocals_path = None
 
         # --- Stage 2: Transcribe ---
         if ckpt is None or ckpt["stage"] < 2:
