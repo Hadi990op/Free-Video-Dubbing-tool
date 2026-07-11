@@ -254,6 +254,56 @@ KOKORO_ENGLISH_BY_GENDER = {
     "child_female": ["af_sky"],
 }
 
+# Japanese voice pool by gender (for ja target — anime/cartoon dubbing)
+JAPANESE_VOICES_BY_GENDER = {
+    "male_adult": [
+        "ja-JP-KeitaNeural",         # Adult male, warm
+    ],
+    "male_elderly": [
+        "ja-JP-KeitaNeural",
+    ],
+    "female_adult": [
+        "ja-JP-NanamiNeural",        # Adult female, warm
+    ],
+    "female_elderly": [
+        "ja-JP-NanamiNeural",
+    ],
+    "child_male": [
+        "ja-JP-KeitaNeural",         # Use male with rate +10%
+    ],
+    "child_female": [
+        "ja-JP-NanamiNeural",        # Use female with rate +10%
+    ],
+}
+
+# Chinese voice pool by gender (for zh target — anime/cartoon dubbing)
+CHINESE_VOICES_BY_GENDER = {
+    "male_adult": [
+        "zh-CN-YunjianNeural",       # Adult male, deep
+        "zh-CN-YunxiNeural",         # Adult male, young
+        "zh-CN-YunyangNeural",       # Adult male, warm
+        "zh-TW-YunJheNeural",        # Adult male, Taiwanese
+    ],
+    "male_elderly": [
+        "zh-CN-YunjianNeural",
+    ],
+    "female_adult": [
+        "zh-CN-XiaoxiaoNeural",      # Adult female, warm
+        "zh-CN-XiaoyiNeural",        # Adult female, young
+        "zh-TW-HsiaoChenNeural",     # Adult female, Taiwanese
+        "zh-HK-HiuGaaiNeural",       # Adult female, Cantonese
+    ],
+    "female_elderly": [
+        "zh-CN-XiaoxiaoNeural",
+    ],
+    "child_male": [
+        "zh-CN-YunxiaNeural",        # Male, higher pitched (young sounding)
+    ],
+    "child_female": [
+        "zh-CN-XiaoyiNeural",        # Female, young sounding
+    ],
+}
+
 
 def get_voice_by_profile(gender: str, age: str, target_lang: str,
                          speaker_index: int = 0) -> str:
@@ -278,6 +328,10 @@ def get_voice_by_profile(gender: str, age: str, target_lang: str,
         pool = HINDI_VOICES_BY_GENDER.get(profile_key, HINDI_VOICES_BY_GENDER.get("male_adult"))
     elif target_lang == "en":
         pool = ENGLISH_VOICES_BY_GENDER.get(profile_key, ENGLISH_VOICES_BY_GENDER.get("male_adult"))
+    elif target_lang == "ja":
+        pool = JAPANESE_VOICES_BY_GENDER.get(profile_key, JAPANESE_VOICES_BY_GENDER.get("male_adult"))
+    elif target_lang == "zh":
+        pool = CHINESE_VOICES_BY_GENDER.get(profile_key, CHINESE_VOICES_BY_GENDER.get("male_adult"))
     else:
         # For other languages, fall back to the generic VOICE_POOL
         # (imported from dubber.py)
