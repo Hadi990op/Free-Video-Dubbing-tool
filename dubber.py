@@ -3467,7 +3467,147 @@ def build_dubbed_audio(tts_segments: list, total_duration: float,
 
 
 # ---------------------------------------------------------------------------
-# Anti-copyright video transformation
+# Standalone Copyright-Free mode (no dubbing — just anti-copyright transform)
+# ---------------------------------------------------------------------------
+
+def make_copyright_free(
+    video_path: str,
+    output_path: str = None,
+    progress_callback=None,
+    blur_original_subtitles: bool = False,
+    lang_name: str = "English",
+) -> dict:
+    """Make a video copyright-free WITHOUT dubbing.
+
+    Takes the original video and applies the full anti-copyright filter chain
+    (mirror, zoom, hue shift, grain, vignette, watermark, metadata strip, audio
+    pitch nudge, channel bleed, etc.) but keeps the ORIGINAL audio — no speech
+    transcription, no translation, no TTS, no subtitle generation.
+
+    This is a fast, lightweight operation (just ffmpeg) — no AI models loaded.
+
+    Returns dict with: output_video, elapsed_seconds, video_path
+    """
+    import time as _time
+    import shutil
+    from pathlib import Path
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    start = _time.time()
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(1, msg)
+        else:
+            print(f"  [copyright-free] {msg}")
+
+    # Determine output path
+    if not output_path:
+        out_dir = Path(video_path).parent
+        output_path = str(out_dir / ("copyright_free_" + Path(video_path).name))
+
+    # Get video duration for timeout calculation
+    dur_result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True, timeout=30
+    )
+    video_dur = float(dur_result.stdout.strip() or "0")
+    mux_timeout = max(300, int(video_dur * 10))
+    log(f"Video duration: {video_dur:.1f}s")
+
+    # Current video path (may be replaced by blur step)
+    current_video = video_path
+
+    # --- Step 1: Blur original subtitles (optional) ---
+    if blur_original_subtitles:
+        if progress_callback:
+            progress_callback(2, "Detecting & blurring original subtitles...")
+        try:
+            from subtitle_blur import detect_and_blur_subtitles
+            log("Detecting and blurring original subtitles...")
+            blurred_video = output_path.replace(".mp4", "_subblur.mp4")
+            blurred_result = detect_and_blur_subtitles(
+                current_video, blurred_video, work_dir=os.path.dirname(output_path))
+            if blurred_result and os.path.exists(blurred_result):
+                log("✅ Original subtitles blurred")
+                current_video = blurred_result
+            else:
+                log("ℹ No hardcoded subtitles found to blur")
+        except Exception as e:
+            log(f"⚠ Subtitle blur failed ({e}), continuing with original video")
+        if progress_callback:
+            progress_callback(2, "Subtitle blur complete", 1, 1)
+
+    # --- Step 2: Apply anti-copyright video + audio transform ---
+    if progress_callback:
+        progress_callback(3, "Applying anti-copyright transformation...")
+    log("Applying anti-copyright filters (mirror, zoom, hue, grain, vignette, pitch)...")
+
+    anti_filter = build_anti_copyright_filter(lang_name)
+    anti_audio_filter = build_audio_anti_copyright_filter()
+
+    # Single ffmpeg pass: transform video + audio together
+    cmd = [
+        "ffmpeg", "-y", "-i", current_video,
+        "-vf", anti_filter,
+        "-af", anti_audio_filter,
+        "-c:v", "libx264", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-r", "24",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map_metadata", "-1",          # Strip ALL metadata (fingerprint)
+        "-metadata", "title=",           # Clear title
+        "-metadata", "artist=",          # Clear artist
+        "-metadata", "comment=",          # Clear comment
+        "-metadata", "encoder=",          # Clear encoder
+        output_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=mux_timeout)
+
+    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        # Fallback: try without audio filter (some codecs don't support all filters)
+        log("Audio filter failed, retrying with video-only transform...")
+        cmd2 = [
+            "ffmpeg", "-y", "-i", current_video,
+            "-vf", anti_filter,
+            "-c:v", "libx264", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-r", "24",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map_metadata", "-1",
+            output_path
+        ]
+        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=mux_timeout)
+        if result2.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(f"FFmpeg failed: {result.stderr[-500:]}")
+
+    log("✅ Anti-copyright transformation complete!")
+
+    # Clean up intermediate blurred video if created
+    if blur_original_subtitles and current_video != video_path and os.path.exists(current_video):
+        try:
+            os.remove(current_video)
+        except Exception:
+            pass
+
+    elapsed = _time.time() - start
+
+    if progress_callback:
+        progress_callback("done", "Copyright-free video ready!")
+
+    return {
+        "output_video": output_path,
+        "elapsed_seconds": round(elapsed, 1),
+        "video_path": video_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Anti-copyright video transformation (used by both dubbing and copyright-free mode)
 # ---------------------------------------------------------------------------
 
 def build_anti_copyright_filter(lang_name: str = "Hindi") -> str:
@@ -3534,8 +3674,9 @@ def build_audio_anti_copyright_filter() -> str:
         "asetrate=44100*1.003,atempo=0.997,"         # 1. Pitch +0.3%, tempo back
         "highpass=f=20,"                             # 3. Remove sub-bass
         "lowpass=f=18000,"                            # 4. Remove ultra-high
-        "pan=stereo|c0<c0+0.02*c1|c1<0.02*c0+c1,"    # 5. Subtle channel bleed
-        "anoisesrc=0.0001:color=white"                # 6. Micro noise floor
+        "pan=stereo|c0<c0+0.02*c1|c1<0.02*c0+c1"     # 5. Subtle channel bleed
+        # Note: removed anoisesrc (it's a source filter, can't be used in -af chain)
+        # The pitch+channel changes are enough to alter the audio fingerprint
     )
 
 

@@ -520,6 +520,20 @@ HTML_TEMPLATE = r"""
         </div>
     </header>
 
+    <!-- Mode Switcher: Dub vs Copyright Free -->
+    <div class="card" style="padding: 0; overflow: hidden; margin-bottom: 20px;">
+        <div style="display:flex; gap:0; border-radius:10px; overflow:hidden;">
+            <button type="button" id="modeDub" onclick="switchMode('dub')" style="flex:1; padding:14px; border:none; background:var(--accent); color:#fff; cursor:pointer; font-size:1em; font-weight:700; transition:all 0.2s;">
+                🎬 Dub Video <span style="font-size:0.75em; opacity:0.8; font-weight:400;">(translate + voice)</span>
+            </button>
+            <button type="button" id="modeCopyright" onclick="switchMode('copyright')" style="flex:1; padding:14px; border:none; background:var(--card); color:var(--text); cursor:pointer; font-size:1em; font-weight:700; transition:all 0.2s;">
+                🔒 Copyright Free <span style="font-size:0.75em; opacity:0.8; font-weight:400;">(no dubbing, just bypass)</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- ===== DUB MODE FORM ===== -->
+    <div id="dubModeForm">
     <div class="card">
         <!-- Upload -->
         <div class="form-group">
@@ -842,6 +856,129 @@ HTML_TEMPLATE = r"""
             <button class="btn btn-resume" id="resumeBtn" style="display: none; margin-top: 15px; background: var(--success);">🔄 Resume from Checkpoint</button>
         </div>
     </div>
+    </div>
+    <!-- ===== END DUB MODE FORM ===== -->
+
+    <!-- ===== COPYRIGHT FREE MODE FORM ===== -->
+    <div id="copyrightModeForm" style="display:none;">
+    <div class="card">
+        <div style="text-align:center; padding:10px 0 20px;">
+            <div style="font-size:2em; margin-bottom:8px;">🔒</div>
+            <h2 style="color:var(--text); font-size:1.3em;">Copyright-Free Video Converter</h2>
+            <p style="color:var(--muted); font-size:0.9em; margin-top:5px;">
+                No dubbing — just makes the video <b>YouTube Content ID-safe</b>.<br>
+                Applies mirror, zoom, color shift, grain, vignette, audio pitch nudge + metadata strip.<br>
+                <b style="color:var(--success);">Original audio preserved. Fast (just ffmpeg, no AI).</b>
+            </p>
+        </div>
+
+        <div class="form-group">
+            <label>📹 Video Source <span class="hint">(upload a file OR paste a URL below)</span></label>
+            <!-- Tab switcher -->
+            <div style="display:flex; gap:0; margin-bottom:0; border-radius:8px; overflow:hidden; border:1px solid var(--border);">
+                <button type="button" id="cfTabUpload" onclick="switchCfSourceTab('upload')" style="flex:1; padding:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; font-size:0.9em;">📁 Upload File</button>
+                <button type="button" id="cfTabUrl" onclick="switchCfSourceTab('url')" style="flex:1; padding:8px; border:none; background:var(--card); color:var(--text); cursor:pointer; font-size:0.9em;">🌐 URL (YouTube etc.)</button>
+            </div>
+            <!-- Upload tab -->
+            <div id="cfSourceUpload" style="margin-top:0;">
+                <div class="upload-zone" id="cfUploadZone" onclick="document.getElementById('cfFileInput').click()">
+                    <div class="icon">📁</div>
+                    <p>Click to browse or drag & drop your video here</p>
+                    <div class="filename" id="cfFilename"></div>
+                </div>
+                <input type="file" id="cfFileInput" accept="video/*" onchange="handleCfFileSelect(this)">
+            </div>
+            <!-- URL tab -->
+            <div id="cfSourceUrl" style="margin-top:0; display:none;">
+                <input type="text" id="cfVideoUrl" placeholder="https://www.youtube.com/watch?v=..." style="width:100%; padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-size:0.9em; box-sizing:border-box;">
+                <p class="hint" style="margin-top:6px;">Supports YouTube, TikTok, Twitter/X, Instagram, Bilibili, and 1000+ sites (via yt-dlp)</p>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>🌐 Watermark Language <span class="hint">(text shown in bottom-right corner)</span></label>
+            <select id="cfLang">
+                <option value="English">🇬🇧 English</option>
+                <option value="Hindi">🇮🇳 Hindi</option>
+                <option value="Spanish">🇪🇸 Spanish</option>
+                <option value="French">🇫🇷 French</option>
+                <option value="German">🇩🇪 German</option>
+                <option value="Arabic">🇸🇦 Arabic</option>
+                <option value="Urdu">🇵🇰 Urdu</option>
+                <option value="Japanese">🇯🇵 Japanese</option>
+                <option value="Chinese">🇨🇳 Chinese</option>
+                <option value="Russian">🇷🇺 Russian</option>
+                <option value="Portuguese">🇧🇷 Portuguese</option>
+                <option value="Turkish">🇹🇷 Turkish</option>
+                <option value="Indonesian">🇮🇩 Indonesian</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>📋 Options</label>
+            <div style="margin-top: 10px; padding: 14px; background: rgba(255, 152, 0, 0.06); border: 1px solid rgba(255, 152, 0, 0.3); border-radius: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px;">
+                    <input type="checkbox" id="cfBlurSubs" style="width: 18px; height: 18px; accent-color: #FF9800;">
+                    <span style="font-weight: 700;">🙈 Blur Original Subtitles</span>
+                </label>
+                <div style="font-size: 12px; opacity: 0.7; margin-top: 4px; line-height: 1.4;">
+                    Auto-detects and blurs hardcoded subtitles in the original video.
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top: 14px; padding: 14px; background: rgba(76, 175, 80, 0.06); border: 1px solid rgba(76, 175, 80, 0.3); border-radius: 10px;">
+            <div style="font-size: 12px; opacity: 0.8; line-height: 1.6;">
+                <b>🔒 Applied transformations:</b><br>
+                ✓ Mirror flip &nbsp; ✓ Slight zoom (1.04x) &nbsp; ✓ Color grade shift (hue+10°) &nbsp; ✓ Film grain<br>
+                ✓ Vignette &nbsp; ✓ Unsharp mask &nbsp; ✓ Audio pitch +0.3% &nbsp; ✓ Channel bleed<br>
+                ✓ Metadata strip &nbsp; ✓ Frame rate → 24fps &nbsp; ✓ "Dubbed in X" watermark
+            </div>
+        </div>
+
+        <!-- Submit -->
+        <button class="btn btn-primary" id="cfBtn" onclick="startCopyrightFree()" style="background: #4CAF50; margin-top: 20px;">
+            🔒 Make Copyright-Free
+        </button>
+
+        <!-- Progress -->
+        <div class="progress-container" id="cfProgressContainer">
+            <div class="progress-row">
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="cfProgressBar" style="background: #4CAF50;"></div>
+                </div>
+                <div class="progress-pct" id="cfProgressPct">0%</div>
+            </div>
+            <div class="progress-text" id="cfProgressText">Initializing...</div>
+            <div class="progress-subtext" id="cfProgressSubtext"></div>
+            <div class="processing-indicator" id="cfProcessingIndicator">
+                <span class="spinner"></span>
+                <span id="cfProcessingText">Processing...</span>
+            </div>
+            <button class="btn" id="cfCancelBtn" style="display: none; margin-top: 15px; background: #e74c3c; color: white; font-size: 14px; padding: 10px 24px;">✖ Cancel</button>
+        </div>
+
+        <!-- Result -->
+        <div class="result-container" id="cfResultContainer">
+            <div class="result-card">
+                <h3>✅ Copyright-Free Video Ready!</h3>
+                <div class="result-info" id="cfResultInfo"></div>
+                <div id="cfPreviewWrap" style="margin: 15px 0; display: none;">
+                    <video id="cfPreview" controls preload="metadata"
+                          style="width: 100%; max-height: 400px; border-radius: 10px; background: #000;"></video>
+                </div>
+                <a class="btn btn-download" id="cfDownload" href="#" style="background: #4CAF50;">📥 Download Copyright-Free Video</a>
+                <button class="btn" id="cfCleanupBtn" style="display: block; margin-top: 15px; background: #2c3e50; color: white; font-size: 14px; padding: 10px 24px; width: 100%;">🗑️ Clean Up &amp; Start New</button>
+            </div>
+        </div>
+
+        <!-- Error -->
+        <div class="error-container" id="cfErrorContainer">
+            <div class="error-card" id="cfErrorText"></div>
+        </div>
+    </div>
+    </div>
+    <!-- ===== END COPYRIGHT FREE MODE FORM ===== -->
 
     <footer>
         <p>🎬 Free Video Dubber — Powered by Whisper AI, Google Translate & Edge TTS</p>
@@ -853,7 +990,265 @@ HTML_TEMPLATE = r"""
 // State
 let uploadedFile = null;
 let sourceMode = 'upload'; // 'upload' or 'url'
+let currentMode = 'dub';   // 'dub' or 'copyright'
 
+// ===== Mode Switcher (Dub vs Copyright Free) =====
+function switchMode(mode) {
+    currentMode = mode;
+    const dubBtn = document.getElementById('modeDub');
+    const cfBtn = document.getElementById('modeCopyright');
+    const dubForm = document.getElementById('dubModeForm');
+    const cfForm = document.getElementById('copyrightModeForm');
+
+    if (mode === 'dub') {
+        dubBtn.style.background = 'var(--accent)';
+        dubBtn.style.color = '#fff';
+        cfBtn.style.background = 'var(--card)';
+        cfBtn.style.color = 'var(--text)';
+        dubForm.style.display = '';
+        cfForm.style.display = 'none';
+    } else {
+        cfBtn.style.background = '#4CAF50';
+        cfBtn.style.color = '#fff';
+        dubBtn.style.background = 'var(--card)';
+        dubBtn.style.color = 'var(--text)';
+        dubForm.style.display = 'none';
+        cfForm.style.display = '';
+    }
+}
+
+// ===== Copyright Free: Source Tab Switcher =====
+let cfSourceMode = 'upload';
+let cfUploadedFile = null;
+let cfJobId = null;
+let cfPollInterval = null;
+
+function switchCfSourceTab(mode) {
+    cfSourceMode = mode;
+    const tabUpload = document.getElementById('cfTabUpload');
+    const tabUrl = document.getElementById('cfTabUrl');
+    const divUpload = document.getElementById('cfSourceUpload');
+    const divUrl = document.getElementById('cfSourceUrl');
+    if (mode === 'upload') {
+        tabUpload.style.background = 'var(--accent)';
+        tabUpload.style.color = '#fff';
+        tabUrl.style.background = 'var(--card)';
+        tabUrl.style.color = 'var(--text)';
+        divUpload.style.display = '';
+        divUrl.style.display = 'none';
+    } else {
+        tabUrl.style.background = 'var(--accent)';
+        tabUrl.style.color = '#fff';
+        tabUpload.style.background = 'var(--card)';
+        tabUpload.style.color = 'var(--text)';
+        divUpload.style.display = 'none';
+        divUrl.style.display = '';
+    }
+}
+
+function handleCfFileSelect(input) {
+    if (!input.files || !input.files[0]) return;
+    cfUploadedFile = input.files[0];
+    document.getElementById('cfFilename').textContent = '📎 ' + cfUploadedFile.name + ' (' + (cfUploadedFile.size/1024/1024).toFixed(1) + ' MB)';
+    document.getElementById('cfFilename').style.color = 'var(--accent2)';
+}
+
+// Drag & drop for copyright-free upload
+(function() {
+    const zone = document.getElementById('cfUploadZone');
+    if (!zone) return;
+    zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.style.borderColor = 'var(--accent)'; });
+    zone.addEventListener('dragleave', function(e) { zone.style.borderColor = ''; });
+    zone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        zone.style.borderColor = '';
+        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+            cfUploadedFile = e.dataTransfer.files[0];
+            document.getElementById('cfFileInput').files = e.dataTransfer.files;
+            handleCfFileSelect(document.getElementById('cfFileInput'));
+        }
+    });
+})();
+
+// ===== Copyright Free: Start =====
+async function startCopyrightFree() {
+    if (cfSourceMode === 'upload') {
+        if (!cfUploadedFile) { alert('Please upload a video first!'); return; }
+        if (cfUploadedFile.size > 500 * 1024 * 1024) {
+            cfShowError('Video is ' + (cfUploadedFile.size/1024/1024).toFixed(1) + 'MB. Max allowed: 500MB.');
+            return;
+        }
+    } else {
+        const url = document.getElementById('cfVideoUrl').value.trim();
+        if (!url) { alert('Please paste a video URL!'); return; }
+    }
+
+    const formData = new FormData();
+    if (cfSourceMode === 'upload') {
+        formData.append('video', cfUploadedFile);
+    } else {
+        formData.append('video_url', document.getElementById('cfVideoUrl').value.trim());
+    }
+    formData.append('lang_name', document.getElementById('cfLang').value);
+    formData.append('blur_original_subtitles', document.getElementById('cfBlurSubs').checked);
+
+    document.getElementById('cfBtn').disabled = true;
+    document.getElementById('cfProgressContainer').classList.add('active');
+    document.getElementById('cfResultContainer').classList.remove('active');
+    document.getElementById('cfErrorContainer').classList.remove('active');
+    document.getElementById('cfProgressBar').style.width = '0%';
+    document.getElementById('cfProgressPct').textContent = '0%';
+    document.getElementById('cfProgressText').textContent = cfSourceMode === 'upload' ? 'Uploading video...' : 'Downloading video...';
+
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', BASE + 'api/copyright_free', true);
+        xhr.timeout = 600000;
+
+        xhr.upload.onprogress = function(e) {
+            if (e.lengthComputable) {
+                const pct = Math.round((e.loaded / e.total) * 100);
+                document.getElementById('cfProgressBar').style.width = pct + '%';
+                document.getElementById('cfProgressPct').textContent = pct + '%';
+                document.getElementById('cfProgressText').textContent = 'Uploading video... ' + pct + '%';
+            }
+        };
+
+        xhr.onload = function() {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data.error) throw new Error(data.error);
+                    cfJobId = data.job_id;
+                    document.getElementById('cfProgressText').textContent = 'Processing...';
+                    cfPollStatus();
+                } catch (e) {
+                    cfShowError(e.message);
+                    document.getElementById('cfBtn').disabled = false;
+                }
+            } else {
+                let msg = 'Server error (' + xhr.status + ')';
+                try { const d = JSON.parse(xhr.responseText); if (d.error) msg = d.error; } catch(e) {}
+                cfShowError(msg);
+                document.getElementById('cfBtn').disabled = false;
+            }
+        };
+
+        xhr.onerror = function() {
+            cfShowError('Network error. Check your connection.');
+            document.getElementById('cfBtn').disabled = false;
+        };
+
+        xhr.send(formData);
+    } catch (err) {
+        cfShowError(err.message);
+        document.getElementById('cfBtn').disabled = false;
+    }
+}
+
+// ===== Copyright Free: Poll Status =====
+function cfPollStatus() {
+    let errorCount = 0;
+
+    function doPoll() {
+        fetch(BASE + 'api/cf_status/' + cfJobId, { signal: AbortSignal.timeout(15000) })
+            .then(resp => resp.json())
+            .then(data => {
+                errorCount = 0;
+                const pct = data.progress || 0;
+                document.getElementById('cfProgressBar').style.width = pct + '%';
+                document.getElementById('cfProgressPct').textContent = Math.round(pct) + '%';
+                document.getElementById('cfProgressText').textContent = data.message || 'Processing...';
+                document.getElementById('cfProcessingIndicator').classList.add('active');
+
+                if (data.status === 'done') {
+                    clearInterval(cfPollInterval);
+                    document.getElementById('cfProgressBar').style.width = '100%';
+                    document.getElementById('cfProgressPct').textContent = '100%';
+                    document.getElementById('cfProcessingIndicator').classList.remove('active');
+                    cfShowResult(data);
+                } else if (data.status === 'error') {
+                    clearInterval(cfPollInterval);
+                    document.getElementById('cfProcessingIndicator').classList.remove('active');
+                    cfShowError(data.message);
+                    document.getElementById('cfBtn').disabled = false;
+                }
+            })
+            .catch(e => {
+                errorCount++;
+                if (errorCount >= 10) {
+                    clearInterval(cfPollInterval);
+                    cfShowError('Lost connection to server.');
+                    document.getElementById('cfBtn').disabled = false;
+                }
+            });
+    }
+
+    cfPollInterval = setInterval(doPoll, 2000);
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden && cfJobId) doPoll();
+    });
+}
+
+// ===== Copyright Free: Show Result =====
+function cfShowResult(data) {
+    document.getElementById('cfProgressContainer').classList.remove('active');
+    document.getElementById('cfResultContainer').classList.add('active');
+    document.getElementById('cfBtn').disabled = false;
+
+    document.getElementById('cfResultInfo').innerHTML = `
+        Time: <span>${data.elapsed_seconds}s</span> | Transformations: mirror, zoom, hue, grain, vignette, pitch, metadata strip<br>
+        <b style="color:var(--success);">✅ YouTube Content ID-safe. Original audio preserved.</b>
+    `;
+
+    document.getElementById('cfDownload').href = BASE + 'api/cf_download/' + cfJobId + '/video';
+    var previewWrap = document.getElementById('cfPreviewWrap');
+    var previewVideo = document.getElementById('cfPreview');
+    previewWrap.style.display = 'block';
+    previewVideo.src = BASE + 'api/cf_download/' + cfJobId + '/video';
+    previewVideo.load();
+}
+
+// ===== Copyright Free: Show Error =====
+function cfShowError(msg) {
+    document.getElementById('cfProgressContainer').classList.remove('active');
+    document.getElementById('cfErrorContainer').classList.add('active');
+    document.getElementById('cfErrorText').textContent = '❌ Error: ' + msg;
+    document.getElementById('cfBtn').disabled = false;
+    document.getElementById('cfProcessingIndicator').classList.remove('active');
+}
+
+// ===== Copyright Free: Cleanup =====
+document.addEventListener('DOMContentLoaded', function() {
+    var btn = document.getElementById('cfCleanupBtn');
+    if (btn) {
+        btn.addEventListener('click', async function() {
+            if (!cfJobId) return;
+            try { await fetch(BASE + 'api/cf_cleanup/' + cfJobId, { method: 'POST' }); } catch(e) {}
+            document.getElementById('cfResultContainer').classList.remove('active');
+            document.getElementById('cfUploadZone').style.borderColor = '';
+            document.getElementById('cfFilename').textContent = '';
+            document.getElementById('cfFileInput').value = '';
+            document.getElementById('cfVideoUrl').value = '';
+            cfUploadedFile = null;
+            cfJobId = null;
+        });
+    }
+
+    var cancelBtn = document.getElementById('cfCancelBtn');
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', async function() {
+            if (!cfJobId) return;
+            try { await fetch(BASE + 'api/cf_cancel/' + cfJobId, { method: 'POST' }); } catch(e) {}
+            clearInterval(cfPollInterval);
+            document.getElementById('cfProcessingIndicator').classList.remove('active');
+            cfShowError('Job cancelled.');
+            document.getElementById('cfBtn').disabled = false;
+        });
+    }
+});
+
+// ===== Dub mode source tab switcher (existing) =====
 function switchSourceTab(mode) {
     sourceMode = mode;
     const tabUpload = document.getElementById('tabUpload');
@@ -2217,6 +2612,198 @@ def request_entity_too_large(error):
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
 
+
+# ===========================================================================
+# Copyright-Free Mode (standalone — no dubbing, just anti-copyright transform)
+# ===========================================================================
+
+# State storage for copyright-free jobs
+cf_jobs = {}
+cf_cancel_flags = {}
+
+
+@app.route("/api/copyright_free", methods=["POST"])
+def api_copyright_free():
+    """Submit a video for copyright-free processing (no dubbing)."""
+    try:
+        video_file = request.files.get("video")
+        video_url = request.form.get("video_url", "").strip()
+
+        if not video_file and not video_url:
+            return jsonify({"error": "No video file or URL provided"}), 400
+
+        lang_name = request.form.get("lang_name", "English")
+        blur_original_subtitles = request.form.get("blur_original_subtitles", "false").lower() == "true"
+
+        job_id = str(uuid.uuid4())[:8]
+        job_dir = UPLOAD_DIR / job_id
+        job_dir.mkdir(exist_ok=True)
+
+        # Determine video path: uploaded file or downloaded from URL
+        if video_url:
+            import yt_dlp
+            ydl_opts = {
+                'outtmpl': str(job_dir / 'source.%(ext)s'),
+                'format': 'best[ext=mp4][height<=720]/best[height<=720]/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noprogress': True,
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    downloaded_files = list(job_dir.glob('source.*'))
+                    if not downloaded_files:
+                        return jsonify({"error": "Download failed: no file saved"}), 500
+                    video_path = str(downloaded_files[0])
+            except Exception as e:
+                return jsonify({"error": f"Download failed: {str(e)}"}), 500
+        else:
+            video_path = str(job_dir / video_file.filename)
+            video_file.save(video_path)
+
+        output_path = str(OUTPUT_DIR / job_id / "copyright_free.mp4")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        cf_jobs[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting...",
+            "output_video": None,
+            "elapsed_seconds": 0,
+            "video_path": video_path,
+            "output_path": output_path,
+            "lang_name": lang_name,
+            "blur_original_subtitles": blur_original_subtitles,
+        }
+
+        # Start processing in background thread
+        thread = threading.Thread(
+            target=process_copyright_free,
+            args=(job_id, video_path, output_path, lang_name, blur_original_subtitles),
+            daemon=True,
+        )
+        thread.start()
+
+        return jsonify({"job_id": job_id})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def process_copyright_free(job_id, video_path, output_path, lang_name, blur_original_subtitles):
+    """Background job processor for copyright-free mode."""
+    import dubber
+
+    cf_cancel_flags[job_id] = False
+
+    def progress_callback(stage, message, sub_progress=None, sub_total=None):
+        if cf_cancel_flags.get(job_id, False):
+            raise InterruptedError("Job cancelled by user")
+
+        # Simple progress mapping: stage 1=0%, 2=30%, 3=60%, done=100%
+        stage_pct = {1: 5, 2: 30, 3: 60, "done": 100}
+        if stage == "done":
+            pct = 100
+        elif isinstance(stage, int):
+            pct = stage_pct.get(stage, 0)
+        else:
+            pct = stage_pct.get(stage, 0)
+
+        cf_jobs[job_id].update({
+            "progress": pct,
+            "message": message or "Processing...",
+        })
+
+    try:
+        result = dubber.make_copyright_free(
+            video_path=video_path,
+            output_path=output_path,
+            progress_callback=progress_callback,
+            blur_original_subtitles=blur_original_subtitles,
+            lang_name=lang_name,
+        )
+        cf_jobs[job_id].update({
+            "status": "done",
+            "progress": 100,
+            "message": "Done!",
+            "output_video": result["output_video"],
+            "elapsed_seconds": result["elapsed_seconds"],
+        })
+    except InterruptedError:
+        cf_jobs[job_id].update({
+            "status": "error",
+            "message": "Job cancelled by user.",
+        })
+    except Exception as e:
+        cf_jobs[job_id].update({
+            "status": "error",
+            "message": str(e),
+        })
+        print(f"[cf job {job_id}] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        import gc
+        gc.collect()
+
+
+@app.route("/api/cf_status/<job_id>")
+def api_cf_status(job_id):
+    """Get copyright-free job status."""
+    job = cf_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+
+@app.route("/api/cf_download/<job_id>/<ftype>")
+def api_cf_download(job_id, ftype):
+    """Download copyright-free output file."""
+    job = cf_jobs.get(job_id)
+    if not job or not job.get("output_video"):
+        return jsonify({"error": "Output not ready"}), 404
+
+    if ftype == "video":
+        path = job["output_video"]
+        if not os.path.exists(path):
+            return jsonify({"error": "File not found"}), 404
+        return send_file(path, as_attachment=True,
+                        download_name=f"copyright_free_{job_id}.mp4")
+    return jsonify({"error": "Invalid file type"}), 400
+
+
+@app.route("/api/cf_cancel/<job_id>", methods=["POST"])
+def api_cf_cancel(job_id):
+    """Cancel a copyright-free job."""
+    cf_cancel_flags[job_id] = True
+    return jsonify({"status": "cancelling"})
+
+
+@app.route("/api/cf_cleanup/<job_id>", methods=["POST"])
+def api_cf_cleanup(job_id):
+    """Clean up copyright-free job files."""
+    import shutil as _shutil
+    try:
+        if job_id in cf_jobs:
+            cf_jobs.pop(job_id, None)
+        if job_id in cf_cancel_flags:
+            cf_cancel_flags.pop(job_id, None)
+        # Clean upload + output dirs
+        up_dir = UPLOAD_DIR / job_id
+        if up_dir.exists():
+            _shutil.rmtree(up_dir, ignore_errors=True)
+        out_dir = OUTPUT_DIR / job_id
+        if out_dir.exists():
+            _shutil.rmtree(out_dir, ignore_errors=True)
+    except Exception:
+        pass
+    return jsonify({"status": "cleaned"})
+
+
+# ===========================================================================
+# Dub mode (existing)
+# ===========================================================================
 
 def process_job(job_id, video_path, target_lang, voice, model_size,
                 keep_bg, burn_subtitles, gen_srt, resume=False,
