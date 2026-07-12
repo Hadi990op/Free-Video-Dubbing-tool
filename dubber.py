@@ -4451,7 +4451,19 @@ def dub_video(
 
         # --- Stage 4: Generate TTS ---
         if ckpt is None or ckpt["stage"] < 4:
-            mode_str = "voice cloning" if use_voice_cloning else "Edge-TTS"
+            # Determine TTS mode for display
+            _kokoro_active = False
+            try:
+                import kokoro_tts
+                _kokoro_active = kokoro_tts.is_supported(target_lang)
+            except ImportError:
+                pass
+            if use_voice_cloning:
+                mode_str = "voice cloning"
+            elif _kokoro_active:
+                mode_str = "Kokoro TTS (SOTA quality)"
+            else:
+                mode_str = "Edge-TTS"
             if emotion_transfer and emotion_profiles:
                 mode_str += " + emotion"
             log(4, f"  [4/5] Generating voice with {mode_str}...", 0, len(translated_segments))

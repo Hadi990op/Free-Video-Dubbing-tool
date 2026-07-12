@@ -515,18 +515,37 @@ HTML_TEMPLATE = r"""
             <span class="badge">🎭 Voice Cloning</span>
             <span class="badge green">✅ $0 Cost</span>
         </div>
+        <div style="margin-top:10px;">
+            <a href="/dub/manager" style="display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:6px 16px;border-radius:20px;font-size:0.8em;text-decoration:none;font-weight:600;">🎛️ Pipeline Manager</a>
+        </div>
     </header>
 
     <div class="card">
         <!-- Upload -->
         <div class="form-group">
-            <label>📹 Upload Video <span class="hint">(MP4, MKV, AVI, MOV, etc.)</span></label>
-            <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
-                <div class="icon">📁</div>
-                <p>Click to browse or drag & drop your video here</p>
-                <div class="filename" id="filename"></div>
+            <label>📹 Video Source <span class="hint">(upload a file OR paste a URL below)</span></label>
+
+            <!-- Tab switcher -->
+            <div style="display:flex; gap:0; margin-bottom:0; border-radius:8px; overflow:hidden; border:1px solid var(--border);">
+                <button type="button" id="tabUpload" onclick="switchSourceTab('upload')" style="flex:1; padding:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; font-size:0.9em;">📁 Upload File</button>
+                <button type="button" id="tabUrl" onclick="switchSourceTab('url')" style="flex:1; padding:8px; border:none; background:var(--card); color:var(--text); cursor:pointer; font-size:0.9em;">🌐 URL (YouTube etc.)</button>
             </div>
-            <input type="file" id="fileInput" accept="video/*" onchange="handleFileSelect(this)">
+
+            <!-- Upload tab -->
+            <div id="sourceUpload" style="margin-top:0;">
+                <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+                    <div class="icon">📁</div>
+                    <p>Click to browse or drag & drop your video here</p>
+                    <div class="filename" id="filename"></div>
+                </div>
+                <input type="file" id="fileInput" accept="video/*" onchange="handleFileSelect(this)">
+            </div>
+
+            <!-- URL tab -->
+            <div id="sourceUrl" style="margin-top:0; display:none;">
+                <input type="text" id="videoUrl" placeholder="https://www.youtube.com/watch?v=..." style="width:100%; padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-size:0.9em; box-sizing:border-box;">
+                <p class="hint" style="margin-top:6px;">Supports YouTube, TikTok, Twitter/X, Instagram, Bilibili, and 1000+ sites (via yt-dlp)</p>
+            </div>
         </div>
 
         <!-- Target Language -->
@@ -833,6 +852,42 @@ HTML_TEMPLATE = r"""
 <script>
 // State
 let uploadedFile = null;
+let sourceMode = 'upload'; // 'upload' or 'url'
+
+function switchSourceTab(mode) {
+    sourceMode = mode;
+    const tabUpload = document.getElementById('tabUpload');
+    const tabUrl = document.getElementById('tabUrl');
+    const divUpload = document.getElementById('sourceUpload');
+    const divUrl = document.getElementById('sourceUrl');
+    if (mode === 'upload') {
+        tabUpload.style.background = 'var(--accent)';
+        tabUpload.style.color = '#fff';
+        tabUrl.style.background = 'var(--card)';
+        tabUrl.style.color = 'var(--text)';
+        divUpload.style.display = '';
+        divUrl.style.display = 'none';
+    } else {
+        tabUrl.style.background = 'var(--accent)';
+        tabUrl.style.color = '#fff';
+        tabUpload.style.background = 'var(--card)';
+        tabUpload.style.color = 'var(--text)';
+        divUpload.style.display = 'none';
+        divUrl.style.display = '';
+        // Enable dub button if URL has text
+        const url = document.getElementById('videoUrl').value.trim();
+        document.getElementById('dubBtn').disabled = !url;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    const urlInput = document.getElementById('videoUrl');
+    if (urlInput) {
+        urlInput.addEventListener('input', function() {
+            document.getElementById('dubBtn').disabled = !this.value.trim() && sourceMode === 'url';
+        });
+    }
+});
 let jobId = null;
 let pollInterval = null;
 let maxProgress = 0;        // monotonic progress — never goes backwards
@@ -993,6 +1048,13 @@ function handleFile(file) {
 
 // Start dubbing
 async function startDubbing() {
+    if (sourceMode === 'url') {
+        const url = document.getElementById('videoUrl').value.trim();
+        if (!url) { alert('Please paste a video URL!'); return; }
+        startDubbingWithURL(url);
+        return;
+    }
+
     if (!uploadedFile) { alert('Please upload a video first!'); return; }
 
     const sizeMB = (uploadedFile.size/1024/1024).toFixed(1);
@@ -1098,6 +1160,89 @@ async function startDubbing() {
                 showError(msg);
                 document.getElementById('dubBtn').disabled = false;
             }
+        };
+
+        xhr.send(formData);
+    } catch (err) {
+        showError(err.message);
+        document.getElementById('dubBtn').disabled = false;
+    }
+}
+
+// Start dubbing with a URL (YouTube etc.)
+async function startDubbingWithURL(url) {
+    document.getElementById('dubBtn').disabled = true;
+    document.getElementById('progressContainer').classList.add('active');
+    document.getElementById('resultContainer').classList.remove('active');
+    document.getElementById('errorContainer').classList.remove('active');
+    document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressPct').textContent = '0%';
+    document.getElementById('progressText').textContent = 'Downloading video from URL...';
+    maxProgress = 0;
+
+    // Clear console log
+    document.getElementById('consoleLog').innerHTML = '';
+
+    // Reset steps
+    for (let i = 1; i <= 5; i++) {
+        document.getElementById('step' + i).className = 'step';
+    }
+
+    try {
+        const formData = new FormData();
+        formData.append('video_url', url);
+        formData.append('target_lang', document.getElementById('targetLang').value);
+        formData.append('voice', document.getElementById('voice').value);
+        formData.append('model_size', document.getElementById('modelSize').value);
+        formData.append('keep_bg', document.getElementById('keepBg').checked);
+        formData.append('burn_subtitles', document.getElementById('burnSubtitles').checked);
+        formData.append('gen_srt', document.getElementById('genSrt').checked);
+        formData.append('multi_speaker', document.getElementById('multiSpeaker').checked);
+        formData.append('voice_clone', document.getElementById('voiceClone').checked);
+        formData.append('extend_video', document.getElementById('extendVideo').checked);
+        formData.append('emotion_transfer', document.getElementById('emotionTransfer').checked);
+        formData.append('prosody_strength', document.getElementById('prosodyStrength').value / 100);
+        formData.append('anti_copyright', document.getElementById('antiCopyright').checked);
+        formData.append('funny_mode', document.getElementById('funnyMode').checked);
+        formData.append('blur_original_subtitles', document.getElementById('blurOriginalSubs').checked);
+        var subLangVal = document.getElementById('subtitleLang').value;
+        if (subLangVal) formData.append('subtitle_lang', subLangVal);
+        var numSpeakersVal = document.getElementById('numSpeakers').value;
+        if (numSpeakersVal) formData.append('num_speakers', numSpeakersVal);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', BASE + 'api/dub', true);
+        xhr.timeout = 600000; // 10 minutes
+
+        xhr.onload = function() {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data.error) {
+                        throw new Error(data.error);
+                    }
+                    jobId = data.job_id;
+                    saveJobId(jobId);
+                    document.getElementById('progressText').textContent = 'Processing...';
+                    pollStatus();
+                } catch (e) {
+                    showError(e.message);
+                    document.getElementById('dubBtn').disabled = false;
+                }
+            } else {
+                let msg = 'Server error (' + xhr.status + ')';
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data.error) msg = data.error;
+                } catch (e) {}
+                showError(msg);
+                document.getElementById('dubBtn').disabled = false;
+            }
+        };
+
+        xhr.onerror = function() {
+            showError('Network error: Could not reach the server.');
+            document.getElementById('dubBtn').disabled = false;
         };
 
         xhr.send(formData);
@@ -1460,6 +1605,480 @@ function resetUI() {
 """
 
 
+MANAGER_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎛️ Pipeline Manager — Dubbing Studio</title>
+<style>
+:root {
+    --bg: #0a0e1a;
+    --card: #131826;
+    --accent: #00d9ff;
+    --accent2: #ff6b6b;
+    --green: #4ecdc4;
+    --yellow: #ffd93d;
+    --orange: #ff9f43;
+    --purple: #a55eea;
+    --text: #e8e8e8;
+    --muted: #8892b0;
+    --border: #1e2738;
+    --danger: #ff4757;
+    --success: #2ed573;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+h1 { font-size: 1.8em; margin-bottom: 5px; }
+h2 { font-size: 1.2em; margin-bottom: 15px; color: var(--muted); }
+.subtitle { color: var(--muted); margin-bottom: 25px; font-size: 0.95em; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+.header .nav { display: flex; gap: 15px; align-items: center; }
+
+/* Stats Grid */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 15px;
+    margin-bottom: 25px;
+}
+.stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+}
+.stat-card .label { color: var(--muted); font-size: 0.8em; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+.stat-card .value { font-size: 2em; font-weight: 700; }
+.stat-card .sub { color: var(--muted); font-size: 0.8em; margin-top: 5px; }
+.stat-card.green .value { color: var(--success); }
+.stat-card.red .value { color: var(--danger); }
+.stat-card.yellow .value { color: var(--yellow); }
+.stat-card.accent .value { color: var(--accent); }
+.stat-card.purple .value { color: var(--purple); }
+
+/* Health bar */
+.health-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 25px;
+}
+.health-section h2 { margin-bottom: 15px; }
+.health-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.health-row .label { font-weight: 600; }
+.health-row .value { color: var(--muted); }
+.health-bar { width: 100%; height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; margin-top: 5px; }
+.health-bar .fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+.health-bar .fill.good { background: var(--success); }
+.health-bar .fill.warn { background: var(--yellow); }
+.health-bar .fill.crit { background: var(--danger); }
+
+/* Queue + History */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 25px; }
+@media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+.panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+}
+.panel h2 { margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }
+.panel h2 .badge { font-size: 0.7em; background: var(--accent); color: var(--bg); padding: 2px 10px; border-radius: 20px; }
+
+/* Job item */
+.job-item {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: border-color 0.2s;
+}
+.job-item:hover { border-color: var(--accent); }
+.job-item .info { flex: 1; }
+.job-item .id { font-family: monospace; color: var(--accent); font-size: 0.85em; }
+.job-item .lang { margin-left: 10px; }
+.job-item .duration { color: var(--muted); font-size: 0.85em; margin-top: 3px; }
+.job-item .status { padding: 4px 12px; border-radius: 20px; font-size: 0.75em; font-weight: 600; text-transform: uppercase; }
+.job-item .status.queued { background: rgba(0,217,255,0.15); color: var(--accent); }
+.job-item .status.running { background: rgba(255,217,61,0.15); color: var(--yellow); }
+.job-item .status.done { background: rgba(46,213,115,0.15); color: var(--success); }
+.job-item .status.error { background: rgba(255,71,87,0.15); color: var(--danger); }
+.job-item .status.paused { background: rgba(255,159,67,0.15); color: var(--orange); }
+.job-item .status.cancelled { background: rgba(136,146,176,0.15); color: var(--muted); }
+.job-item .progress-bar { width: 100%; height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px; }
+.job-item .progress-bar .fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.5s; }
+.job-item .actions { display: flex; gap: 8px; margin-left: 15px; }
+.job-item .actions button {
+    background: var(--border); border: none; color: var(--text);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8em;
+}
+.job-item .actions button:hover { background: var(--accent); color: var(--bg); }
+.job-item .actions button.danger:hover { background: var(--danger); }
+
+/* Batch submit */
+.batch-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 25px;
+}
+.batch-section h2 { margin-bottom: 15px; }
+.batch-section textarea {
+    width: 100%; min-height: 100px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; font-family: monospace; font-size: 0.9em;
+    margin-bottom: 10px; resize: vertical;
+}
+.batch-section select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px; margin-right: 10px; font-size: 0.9em;
+}
+.batch-section button {
+    background: var(--accent); color: var(--bg);
+    border: none; padding: 10px 24px;
+    border-radius: 8px; font-weight: 600; cursor: pointer;
+    font-size: 1em;
+}
+.batch-section button:hover { opacity: 0.85; }
+.batch-section button:disabled { opacity: 0.5; cursor: not-allowed; }
+.batch-result { margin-top: 15px; }
+.batch-result .ok { color: var(--success); }
+.batch-result .fail { color: var(--danger); }
+
+/* Lang stats table */
+.lang-table { width: 100%; border-collapse: collapse; }
+.lang-table th, .lang-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.lang-table th { color: var(--muted); font-size: 0.8em; text-transform: uppercase; }
+.lang-table td { font-size: 0.9em; }
+.lang-flag { font-size: 1.2em; }
+
+/* Refresh indicator */
+.refresh-indicator {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--muted); font-size: 0.85em;
+}
+.refresh-indicator .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--success);
+    animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* Empty state */
+.empty { color: var(--muted); text-align: center; padding: 30px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <h1>🎛️ Pipeline Manager</h1>
+        <div class="subtitle">Intelligent orchestration for the dubbing pipeline — queue, monitor, analyze</div>
+    </div>
+    <div class="nav">
+        <div class="refresh-indicator"><span class="dot"></span> Auto-refresh 5s</div>
+        <a href="/dub/">← Back to Dubber</a>
+    </div>
+</div>
+
+<!-- Stats Grid -->
+<div class="stats-grid" id="statsGrid">
+    <div class="stat-card accent"><div class="label">Total Jobs</div><div class="value" id="statTotal">—</div><div class="sub" id="statQueue">Queue: —</div></div>
+    <div class="stat-card green"><div class="label">Completed</div><div class="value" id="statDone">—</div><div class="sub" id="statSuccessRate">— success rate</div></div>
+    <div class="stat-card red"><div class="label">Failed</div><div class="value" id="statFailed">—</div><div class="sub" id="statCancelled">— cancelled</div></div>
+    <div class="stat-card yellow"><div class="label">Avg Time</div><div class="value" id="statAvgTime">—</div><div class="sub">per completed job</div></div>
+    <div class="stat-card purple"><div class="label">Current Job</div><div class="value" id="statCurrent" style="font-size:1em;word-break:break-all;">—</div><div class="sub" id="statStage">Idle</div></div>
+</div>
+
+<!-- System Health -->
+<div class="health-section">
+    <h2>🖥️ System Health</h2>
+    <div class="health-row">
+        <div style="flex:1">
+            <div class="label">RAM Usage</div>
+            <div class="health-bar"><div class="fill" id="ramBar" style="width:0%"></div></div>
+        </div>
+        <div class="value" style="margin-left:15px;" id="ramText">—</div>
+    </div>
+    <div class="health-row">
+        <div style="flex:1">
+            <div class="label">Disk Usage</div>
+            <div class="health-bar"><div class="fill" id="diskBar" style="width:0%"></div></div>
+        </div>
+        <div class="value" style="margin-left:15px;" id="diskText">—</div>
+    </div>
+    <div class="health-row">
+        <div style="flex:1">
+            <div class="label">CPU Load</div>
+            <div class="health-bar"><div class="fill" id="cpuBar" style="width:0%"></div></div>
+        </div>
+        <div class="value" style="margin-left:15px;" id="cpuText">—</div>
+    </div>
+</div>
+
+<!-- Batch Submit -->
+<div class="batch-section">
+    <h2>📋 Batch Processing — Queue Multiple Videos</h2>
+    <p style="color:var(--muted);margin-bottom:10px;font-size:0.9em;">Paste one URL per line (YouTube, TikTok, etc.). Videos download and process sequentially.</p>
+    <textarea id="batchUrls" placeholder="https://www.youtube.com/watch?v=...&#10;https://www.youtube.com/watch?v=...&#10;https://www.tiktok.com/@user/video/..."></textarea>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="font-size:0.9em;">Target Language:</label>
+        <select id="batchLang">
+            <option value="hi">🇮🇳 Hindi</option>
+            <option value="en">🇬🇧 English</option>
+            <option value="es">🇪🇸 Spanish</option>
+            <option value="fr">🇫🇷 French</option>
+            <option value="ja">🇯🇵 Japanese</option>
+            <option value="zh">🇨🇳 Chinese</option>
+            <option value="ar">🇸🇦 Arabic</option>
+            <option value="ru">🇷🇺 Russian</option>
+            <option value="pt">🇧🇷 Portuguese</option>
+            <option value="de">🇩🇪 German</option>
+            <option value="ko">🇰🇷 Korean</option>
+        </select>
+        <label style="font-size:0.9em;">Model:</label>
+        <select id="batchModel">
+            <option value="base">Base (fast)</option>
+            <option value="small">Small (better)</option>
+            <option value="medium">Medium (best)</option>
+        </select>
+        <button id="batchBtn" onclick="submitBatch()">🚀 Submit Batch</button>
+    </div>
+    <div class="batch-result" id="batchResult"></div>
+</div>
+
+<!-- Queue + History -->
+<div class="two-col">
+    <!-- Queue -->
+    <div class="panel">
+        <h2>📥 Job Queue <span class="badge" id="queueBadge">0</span></h2>
+        <div id="queueList">
+            <div class="empty">No jobs in queue</div>
+        </div>
+    </div>
+
+    <!-- History -->
+    <div class="panel">
+        <h2>📜 Job History <span class="badge" id="historyBadge">0</span></h2>
+        <div id="historyList">
+            <div class="empty">No history yet</div>
+        </div>
+    </div>
+</div>
+
+<!-- Language Stats -->
+<div class="panel" style="margin-bottom:25px;">
+    <h2>🌍 Language Statistics</h2>
+    <table class="lang-table" id="langTable">
+        <thead><tr><th>Language</th><th>Total</th><th>Completed</th><th>Failed</th><th>Avg Time</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">No data</td></tr></tbody>
+    </table>
+</div>
+
+<script>
+const BASE = window.location.pathname.replace(/\/manager\/?$/, '/') ;
+
+async function fetchJSON(url) {
+    try {
+        const r = await fetch(BASE + url);
+        return await r.json();
+    } catch(e) { console.error(e); return null; }
+}
+
+async function refreshStats() {
+    const stats = await fetchJSON('api/manager/stats');
+    if (!stats) return;
+
+    document.getElementById('statTotal').textContent = stats.total_jobs;
+    document.getElementById('statQueue').textContent = `Queue: ${stats.queue_length}`;
+    document.getElementById('statDone').textContent = stats.completed;
+    document.getElementById('statSuccessRate').textContent = stats.success_rate.toFixed(1) + '% success';
+    document.getElementById('statFailed').textContent = stats.failed;
+    document.getElementById('statCancelled').textContent = stats.cancelled + ' cancelled';
+    const avg = stats.avg_processing_time;
+    document.getElementById('statAvgTime').textContent = avg > 0 ? (avg < 60 ? avg.toFixed(0) + 's' : (avg/60).toFixed(1) + 'm') : '—';
+    document.getElementById('statCurrent').textContent = stats.current_job || 'Idle';
+    document.getElementById('statStage').textContent = stats.queue_length > 0 ? `${stats.queue_length} queued` : 'No queue';
+
+    // Language stats
+    const langTable = document.getElementById('langTable').querySelector('tbody');
+    const langStats = stats.language_stats || {};
+    const langRows = Object.entries(langStats);
+    if (langRows.length === 0) {
+        langTable.innerHTML = '<tr><td colspan="5" class="empty">No data</td></tr>';
+    } else {
+        langTable.innerHTML = langRows.map(([lang, s]) => `
+            <tr>
+                <td><span class="lang-flag">${langFlag(lang)}</span> ${lang}</td>
+                <td>${s.total}</td>
+                <td style="color:var(--success)">${s.done}</td>
+                <td style="color:var(--danger)">${s.failed}</td>
+                <td>${s.avg_time > 0 ? (s.avg_time < 60 ? s.avg_time.toFixed(0) + 's' : (s.avg_time/60).toFixed(1) + 'm') : '—'}</td>
+            </tr>
+        `).join('');
+    }
+}
+
+async function refreshHealth() {
+    const h = await fetchJSON('api/manager/health');
+    if (!h) return;
+
+    const ramPct = h.ram.percent;
+    const ramBar = document.getElementById('ramBar');
+    ramBar.style.width = ramPct + '%';
+    ramBar.className = 'fill ' + (ramPct < 70 ? 'good' : ramPct < 90 ? 'warn' : 'crit');
+    document.getElementById('ramText').textContent = `${ramPct}% (${(h.ram.available_mb/1024).toFixed(1)}GB free)`;
+
+    const diskPct = h.disk.percent;
+    const diskBar = document.getElementById('diskBar');
+    diskBar.style.width = diskPct + '%';
+    diskBar.className = 'fill ' + (diskPct < 80 ? 'good' : diskPct < 95 ? 'warn' : 'crit');
+    document.getElementById('diskText').textContent = `${diskPct}% (${(h.disk.free_mb/1024).toFixed(1)}GB free)`;
+
+    const cpuPct = h.cpu_percent;
+    const cpuBar = document.getElementById('cpuBar');
+    cpuBar.style.width = cpuPct + '%';
+    cpuBar.className = 'fill ' + (cpuPct < 60 ? 'good' : cpuPct < 85 ? 'warn' : 'crit');
+    document.getElementById('cpuText').textContent = cpuPct + '%';
+}
+
+async function refreshQueue() {
+    const q = await fetchJSON('api/manager/queue');
+    if (!q) return;
+    const queue = q.queue || [];
+    document.getElementById('queueBadge').textContent = queue.length;
+
+    const list = document.getElementById('queueList');
+    if (queue.length === 0) {
+        list.innerHTML = '<div class="empty">No jobs in queue</div>';
+        return;
+    }
+    list.innerHTML = queue.map(j => `
+        <div class="job-item">
+            <div class="info">
+                <span class="id">${j.job_id}</span>
+                <span class="lang">→ ${j.target_lang}</span>
+                <div class="duration">${(j.video_info.duration || 0).toFixed(0)}s video, queued ${timeAgo(j.queued_at)}</div>
+            </div>
+            <div class="status queued">Queued #${j.queue_position}</div>
+        </div>
+    `).join('');
+}
+
+async function refreshHistory() {
+    const h = await fetchJSON('api/manager/history?limit=20');
+    if (!h) return;
+    const history = h.history || [];
+    document.getElementById('historyBadge').textContent = history.length;
+
+    const list = document.getElementById('historyList');
+    if (history.length === 0) {
+        list.innerHTML = '<div class="empty">No history yet</div>';
+        return;
+    }
+    list.innerHTML = history.slice().reverse().map(j => `
+        <div class="job-item">
+            <div class="info">
+                <span class="id">${j.job_id}</span>
+                <span class="lang">→ ${j.target_lang}</span>
+                <div class="duration">${(j.video_duration || 0).toFixed(0)}s video, ${j.elapsed > 0 ? j.elapsed.toFixed(0) + 's processing' : ''} — ${j.date}</div>
+                ${j.error ? `<div style="color:var(--danger);font-size:0.8em;margin-top:3px;">${j.error}</div>` : ''}
+            </div>
+            <div class="status ${j.status}">${j.status}</div>
+        </div>
+    `).join('');
+}
+
+async function submitBatch() {
+    const urls = document.getElementById('batchUrls').value.trim();
+    if (!urls) { alert('Paste at least one URL!'); return; }
+
+    const lang = document.getElementById('batchLang').value;
+    const model = document.getElementById('batchModel').value;
+
+    document.getElementById('batchBtn').disabled = true;
+    document.getElementById('batchResult').innerHTML = '<div style="color:var(--muted);">⏳ Downloading and queuing...</div>';
+
+    try {
+        const formData = new FormData();
+        formData.append('urls', urls);
+        formData.append('target_lang', lang);
+        formData.append('model_size', model);
+
+        const r = await fetch(BASE + 'api/manager/batch', { method: 'POST', body: formData });
+        const data = await r.json();
+
+        if (data.error) throw new Error(data.error);
+
+        let html = '';
+        if (data.success_count > 0) {
+            html += `<div class="ok">✅ ${data.success_count} job(s) queued successfully</div>`;
+            html += '<ul style="margin-top:8px;margin-left:20px;font-size:0.85em;">';
+            for (const s of data.submitted) {
+                html += `<li><code>${s.job_id}</code> — ${s.title} (${s.duration}s) — Position #${s.queue_position}</li>`;
+            }
+            html += '</ul>';
+        }
+        if (data.failed.length > 0) {
+            html += `<div class="fail">❌ ${data.failed.length} URL(s) failed</div>`;
+            html += '<ul style="margin-top:8px;margin-left:20px;font-size:0.85em;">';
+            for (const f of data.failed) {
+                html += `<li>${f.url} — ${f.error}</li>`;
+            }
+            html += '</ul>';
+        }
+        document.getElementById('batchResult').innerHTML = html;
+        document.getElementById('batchUrls').value = '';
+    } catch(e) {
+        document.getElementById('batchResult').innerHTML = `<div class="fail">Error: ${e.message}</div>`;
+    } finally {
+        document.getElementById('batchBtn').disabled = false;
+    }
+}
+
+function langFlag(lang) {
+    const flags = { hi: '🇮🇳', en: '🇬🇧', es: '🇪🇸', fr: '🇫🇷', ja: '🇯🇵', zh: '🇨🇳', ar: '🇸🇦', ru: '🇷🇺', pt: '🇧🇷', de: '🇩🇪', ko: '🇰🇷', it: '🇮🇹' };
+    return flags[lang] || '🌐';
+}
+
+function timeAgo(ts) {
+    const s = Math.floor(Date.now()/1000 - ts);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s/60) + 'm ago';
+    return Math.floor(s/3600) + 'h ago';
+}
+
+// Auto-refresh
+async function refreshAll() {
+    await Promise.all([refreshStats(), refreshHealth(), refreshQueue(), refreshHistory()]);
+}
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>
+"""
+
+
 # ---------------------------------------------------------------------------
 # API Routes
 # ---------------------------------------------------------------------------
@@ -1469,12 +2088,19 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+@app.route("/manager")
+def manager_dashboard():
+    return render_template_string(MANAGER_TEMPLATE)
+
+
 @app.route("/api/dub", methods=["POST"])
 def api_dub():
     try:
         video_file = request.files.get("video")
-        if not video_file:
-            return jsonify({"error": "No video file provided"}), 400
+        video_url = request.form.get("video_url", "").strip()
+
+        if not video_file and not video_url:
+            return jsonify({"error": "No video file or URL provided"}), 400
 
         target_lang = request.form.get("target_lang", "hi")
         voice = request.form.get("voice", "") or None
@@ -1504,8 +2130,31 @@ def api_dub():
         job_dir = UPLOAD_DIR / job_id
         job_dir.mkdir(exist_ok=True)
 
-        video_path = job_dir / video_file.filename
-        video_file.save(str(video_path))
+        # Determine video path: either uploaded file or downloaded from URL
+        if video_url:
+            # Download video from URL using yt-dlp
+            import yt_dlp
+            ydl_opts = {
+                'outtmpl': str(job_dir / 'source.%(ext)s'),
+                'format': 'best[ext=mp4][height<=720]/best[height<=720]/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noprogress': True,
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    # Get the actual downloaded file path
+                    downloaded_files = list(job_dir.glob('source.*'))
+                    if not downloaded_files:
+                        return jsonify({"error": "Download failed: no file saved"}), 500
+                    video_path = downloaded_files[0]
+                    video_name = info.get('title', 'video')[:50]
+            except Exception as e:
+                return jsonify({"error": f"Download failed: {str(e)}"}), 500
+        else:
+            video_path = job_dir / video_file.filename
+            video_file.save(str(video_path))
 
         # Setup job tracking
         jobs[job_id] = {
@@ -1546,7 +2195,7 @@ def api_dub():
                   model_size, keep_bg, burn_subtitles, gen_srt,
                   False, multi_speaker, num_speakers, voice_clone, extend_video,
                   emotion_transfer, prosody_strength, anti_copyright,
-                  blur_original_subtitles, subtitle_lang),
+                  blur_original_subtitles, subtitle_lang, funny_mode),
             daemon=True,
         )
         thread.start()
@@ -1994,6 +2643,215 @@ def api_download(job_id, ftype):
         return send_file(job["subtitle_srt_file"], as_attachment=True,
                          download_name=f"subtitles_{sub_lang}.srt")
     return jsonify({"error": "File not found"}), 404
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Manager API Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/manager/stats")
+def api_manager_stats():
+    """Get pipeline statistics and system health."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        return jsonify(pm.get_stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/queue")
+def api_manager_queue():
+    """Get current job queue."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        return jsonify({"queue": pm.get_queue()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/history")
+def api_manager_history():
+    """Get job history."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        limit = request.args.get("limit", 50, type=int)
+        return jsonify({"history": pm.get_history(limit)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/health")
+def api_manager_health():
+    """Get detailed system health check."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        disk = psutil.disk_usage(str(Path(__file__).resolve().parent))
+        cpu = psutil.cpu_percent(interval=1)
+
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        stats = pm.get_stats()
+
+        return jsonify({
+            "status": "healthy" if vm.percent < 90 and disk.percent < 95 else "warning",
+            "cpu_percent": cpu,
+            "ram": {
+                "total_mb": round(vm.total / 1024 / 1024),
+                "used_mb": round(vm.used / 1024 / 1024),
+                "available_mb": round(vm.available / 1024 / 1024),
+                "percent": round(vm.percent, 1),
+            },
+            "disk": {
+                "total_mb": round(disk.total / 1024 / 1024),
+                "used_mb": round(disk.used / 1024 / 1024),
+                "free_mb": round(disk.free / 1024 / 1024),
+                "percent": round(disk.percent, 1),
+            },
+            "queue_length": stats["queue_length"],
+            "current_job": stats["current_job"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/batch", methods=["POST"])
+def api_manager_batch():
+    """Submit multiple video URLs as a batch job."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+
+        # Accept both JSON and form data
+        if request.content_type and "application/json" in request.content_type:
+            data = request.get_json(silent=True) or {}
+        else:
+            data = request.form
+
+        urls_raw = data.get("urls", [])
+        if isinstance(urls_raw, str):
+            # Split on newlines or commas
+            urls = [u.strip() for u in urls_raw.replace(",", "\n").split("\n") if u.strip()]
+        elif isinstance(urls_raw, list):
+            urls = [u.strip() for u in urls_raw if u.strip()]
+        else:
+            urls = []
+
+        if not urls:
+            return jsonify({"error": "No URLs provided"}), 400
+
+        target_lang = data.get("target_lang", "hi")
+        options = {
+            "model_size": data.get("model_size", "base"),
+            "voice": data.get("voice"),
+            "keep_bg": data.get("keep_bg", "false").lower() == "true" if isinstance(data.get("keep_bg"), str) else data.get("keep_bg", False),
+            "burn_subtitles": data.get("burn_subtitles", "false").lower() == "true" if isinstance(data.get("burn_subtitles"), str) else data.get("burn_subtitles", False),
+            "gen_srt": data.get("gen_srt", "true").lower() == "true" if isinstance(data.get("gen_srt"), str) else data.get("gen_srt", True),
+            "voice_clone": data.get("voice_clone", "false").lower() == "true" if isinstance(data.get("voice_clone"), str) else data.get("voice_clone", False),
+            "emotion_transfer": data.get("emotion_transfer", "true").lower() == "true" if isinstance(data.get("emotion_transfer"), str) else data.get("emotion_transfer", True),
+            "anti_copyright": data.get("anti_copyright", "false").lower() == "true" if isinstance(data.get("anti_copyright"), str) else data.get("anti_copyright", False),
+            "funny_mode": data.get("funny_mode", "false").lower() == "true" if isinstance(data.get("funny_mode"), str) else data.get("funny_mode", False),
+        }
+
+        import yt_dlp
+        import uuid
+
+        submitted = []
+        failed = []
+
+        for url in urls:
+            try:
+                job_id = str(uuid.uuid4())[:8]
+                job_dir = UPLOAD_DIR / job_id
+                job_dir.mkdir(exist_ok=True)
+
+                # Download video
+                ydl_opts = {
+                    'outtmpl': str(job_dir / 'source.%(ext)s'),
+                    'format': 'best[ext=mp4][height<=720]/best[height<=720]/best',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'noprogress': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    downloaded = list(job_dir.glob('source.*'))
+                    if not downloaded:
+                        failed.append({"url": url, "error": "Download failed"})
+                        continue
+                    video_path = str(downloaded[0])
+
+                # Submit to manager
+                mgr_job_id, result = pm.submit_job(video_path, target_lang,
+                                                     {**options, "job_id": job_id})
+                if result.get("ok"):
+                    submitted.append({
+                        "job_id": mgr_job_id,
+                        "url": url,
+                        "title": info.get("title", "")[:80],
+                        "duration": info.get("duration", 0),
+                        "queue_position": result.get("queue_position"),
+                    })
+                else:
+                    failed.append({"url": url, "error": "; ".join(result.get("errors", []))})
+
+            except Exception as e:
+                failed.append({"url": url, "error": str(e)})
+
+        return jsonify({
+            "submitted": submitted,
+            "failed": failed,
+            "total": len(urls),
+            "success_count": len(submitted),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/job/<job_id>")
+def api_manager_job_status(job_id):
+    """Get detailed status of a manager-tracked job."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        status = pm.get_job_status(job_id)
+        if not status:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/retry/<job_id>", methods=["POST"])
+def api_manager_retry(job_id):
+    """Retry a failed or paused job."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        ok, msg = pm.retry_job(job_id)
+        if ok:
+            return jsonify({"ok": True, "message": msg})
+        return jsonify({"error": msg}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/manager/cancel/<job_id>", methods=["POST"])
+def api_manager_cancel(job_id):
+    """Cancel a queued or running job."""
+    try:
+        from pipeline_manager import get_manager
+        pm = get_manager()
+        ok = pm.cancel_job(job_id)
+        if ok:
+            return jsonify({"ok": True, "message": "Job cancelled"})
+        return jsonify({"error": "Job not found or cannot be cancelled"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
